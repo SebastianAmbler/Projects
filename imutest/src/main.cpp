@@ -26,9 +26,9 @@ constexpr float BETA_MOVING = 0.15f;        // During motion (faster mag correct
 constexpr float BETA_TURNING = 0.20f;       // During yaw rotation (even faster)
 
 // Motion detection thresholds
-constexpr float GYRO_MOTION_THRESHOLD = 0.15f;  // rad/s (~8.6 deg/s) - any axis
-constexpr float YAW_RATE_THRESHOLD = 0.20f;     // rad/s (~11.5 deg/s) - Z axis rotation
-constexpr float ACCEL_MOTION_THRESHOLD = 1.5f;  // m/s^2 deviation from gravity
+constexpr float GYRO_MOTION_THRESHOLD = 0.230f;  // rad/s (~8.6 deg/s) - any axis
+constexpr float YAW_RATE_THRESHOLD = 0.35f;     // rad/s (~11.5 deg/s) - Z axis rotation
+constexpr float ACCEL_MOTION_THRESHOLD = 2.8f;  // m/s^2 deviation from gravity
 
 constexpr unsigned long CONVERGENCE_TIME_MS = 3000;
 constexpr unsigned long ZERO_DELAY_MS = 3500;
