@@ -5,7 +5,6 @@
 MPU9250 IMU(SPI, 10);
 
 // ===================== CALIBRATION CONSTANTS =====================
-// Accel biases (g) and scale factors
 constexpr float ACCEL_BIAS[3] = {0.22f, 0.20f, -0.13f};
 constexpr float ACCEL_SCALE[3] = {1.00f, 1.00f, 0.99f};
 
@@ -19,10 +18,20 @@ constexpr float MAG_SCALE[3] = {1.03f, 0.97f, 1.00f};
 // ===================== CONSTANTS =====================
 constexpr float G_TO_MPS2 = 9.80665f;
 constexpr float SAMPLE_FREQ_HZ = 50.0f;
-constexpr float MADGWICK_BETA_INIT = 0.8f;  // High beta for fast initial convergence
-constexpr float MADGWICK_BETA_STEADY = 0.041f;  // Lower beta for steady state
-constexpr unsigned long CONVERGENCE_TIME_MS = 3000;  // Time for filter to converge
-constexpr unsigned long ZERO_DELAY_MS = 3500;  // Zero after convergence
+
+// Adaptive beta parameters
+constexpr float BETA_INIT = 0.8f;           // Fast initial convergence
+constexpr float BETA_STATIC = 0.041f;       // When stationary (lower noise)
+constexpr float BETA_MOVING = 0.15f;        // During motion (faster mag correction)
+constexpr float BETA_TURNING = 0.20f;       // During yaw rotation (even faster)
+
+// Motion detection thresholds
+constexpr float GYRO_MOTION_THRESHOLD = 0.15f;  // rad/s (~8.6 deg/s) - any axis
+constexpr float YAW_RATE_THRESHOLD = 0.20f;     // rad/s (~11.5 deg/s) - Z axis rotation
+constexpr float ACCEL_MOTION_THRESHOLD = 1.5f;  // m/s^2 deviation from gravity
+
+constexpr unsigned long CONVERGENCE_TIME_MS = 3000;
+constexpr unsigned long ZERO_DELAY_MS = 3500;
 constexpr unsigned long PRINT_INTERVAL_MS = 200;
 
 // ===================== STATE VARIABLES =====================
@@ -41,22 +50,35 @@ struct Orientation {
 };
 
 enum SystemState {
-  CONVERGING,      // Filter is converging with high beta
-  STABILIZING,     // Switched to low beta, waiting to zero
-  READY            // Zeroed and ready
+  CONVERGING,
+  STABILIZING,
+  READY
+};
+
+enum MotionState {
+  STATIC,
+  MOVING,
+  TURNING
 };
 
 unsigned long lastPrintMs = 0;
 unsigned long startTimeMs = 0;
 SystemState state = CONVERGING;
+MotionState motionState = STATIC;
 Orientation zeroOffset = {0.0f, 0.0f, 0.0f};
+
+// Low-pass filter for smooth beta transitions
+float currentBeta = BETA_INIT;
+constexpr float BETA_FILTER_ALPHA = 0.1f;  // Smooth beta changes
 
 // ===================== FUNCTION PROTOTYPES =====================
 void calibrateIMU(float raw[3], const float bias[3], const float scale[3], float output[3], bool isMPS2 = false);
 void remapAxes(const float in[3], float out[3], bool invertZ = false);
 void printIMUData(const IMUData &data, const Orientation &orient);
 void initializeFilterOrientation();
-float normalizeAngle(float angle);
+MotionState detectMotion(const IMUData &data);
+float updateAdaptiveBeta(MotionState motion);
+const char* getMotionStateName(MotionState motion);
 
 // ===================== SETUP =====================
 void setup() {
@@ -79,14 +101,12 @@ void setup() {
   IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
   IMU.setSrd(19);
 
-  // Initialize filter with high beta for fast convergence
   madgwick.begin(SAMPLE_FREQ_HZ);
-  madgwick.setBeta(MADGWICK_BETA_INIT);
+  madgwick.setBeta(BETA_INIT);
 
   Serial.println(F("IMU Ready!"));
   Serial.println(F("Initializing orientation filter..."));
   
-  // Pre-initialize filter with several readings
   initializeFilterOrientation();
   
   startTimeMs = millis();
@@ -122,10 +142,19 @@ void loop() {
   remapAxes(calGyro, data.gyro, true);
   remapAxes(calMag, data.mag, true);
 
+  // Detect motion and adapt beta accordingly
+  if (state == READY) {
+    motionState = detectMotion(data);
+    float targetBeta = updateAdaptiveBeta(motionState);
+    
+    // Smooth beta transitions with low-pass filter
+    currentBeta = currentBeta * (1.0f - BETA_FILTER_ALPHA) + targetBeta * BETA_FILTER_ALPHA;
+    madgwick.setBeta(currentBeta);
+  }
+
   float accelG[3] = {data.accel[0] / G_TO_MPS2, data.accel[1] / G_TO_MPS2, data.accel[2] / G_TO_MPS2};
   float gyroDPS[3] = {data.gyro[0] * RAD_TO_DEG, data.gyro[1] * RAD_TO_DEG, data.gyro[2] * RAD_TO_DEG};
 
-  // Update filter
   madgwick.update(gyroDPS[0], gyroDPS[1], gyroDPS[2], 
                   accelG[0], accelG[1], accelG[2], 
                   data.mag[0], data.mag[1], data.mag[2]);
@@ -134,16 +163,17 @@ void loop() {
 
   // State machine for initialization
   if (state == CONVERGING && elapsedMs >= CONVERGENCE_TIME_MS) {
-    madgwick.setBeta(MADGWICK_BETA_STEADY);
+    madgwick.setBeta(BETA_STATIC);
+    currentBeta = BETA_STATIC;
     state = STABILIZING;
-    Serial.println(F(">>> Filter converged, switching to steady-state mode <<<\n"));
+    Serial.println(F(">>> Filter converged <<<\n"));
   }
   
   if (state == STABILIZING && elapsedMs >= ZERO_DELAY_MS) {
     zeroOffset.roll = orient.roll;
     zeroOffset.pitch = orient.pitch;
     state = READY;
-    Serial.println(F(">>> Roll/Pitch zeroed - System ready <<<\n"));
+    Serial.println(F(">>> System ready - Adaptive beta enabled <<<\n"));
   }
 
   // Apply offsets
@@ -169,7 +199,63 @@ void loop() {
 // ===================== HELPER FUNCTIONS =====================
 
 /**
- * Pre-initialize filter with static readings for better starting point
+ * Detect motion state based on gyro and accel data
+ */
+MotionState detectMotion(const IMUData &data) {
+  // Calculate magnitudes
+  float gyroMag = sqrt(data.gyro[0]*data.gyro[0] + 
+                       data.gyro[1]*data.gyro[1] + 
+                       data.gyro[2]*data.gyro[2]);
+  
+  float yawRate = abs(data.gyro[2]);  // Z-axis rotation rate
+  
+  // Calculate total acceleration magnitude
+  float accelMag = sqrt(data.accel[0]*data.accel[0] + 
+                        data.accel[1]*data.accel[1] + 
+                        data.accel[2]*data.accel[2]);
+  
+  // Deviation from gravity (stationary = ~9.81 m/s^2)
+  float accelDeviation = abs(accelMag - G_TO_MPS2);
+  
+  // Priority: TURNING > MOVING > STATIC
+  if (yawRate > YAW_RATE_THRESHOLD) {
+    return TURNING;
+  } else if (gyroMag > GYRO_MOTION_THRESHOLD || accelDeviation > ACCEL_MOTION_THRESHOLD) {
+    return MOVING;
+  } else {
+    return STATIC;
+  }
+}
+
+/**
+ * Select appropriate beta based on motion state
+ */
+float updateAdaptiveBeta(MotionState motion) {
+  switch (motion) {
+    case TURNING:
+      return BETA_TURNING;  // Highest beta for fast mag correction during yaw
+    case MOVING:
+      return BETA_MOVING;   // Medium beta during translation/rotation
+    case STATIC:
+    default:
+      return BETA_STATIC;   // Lowest beta when stationary for minimal noise
+  }
+}
+
+/**
+ * Get human-readable motion state name
+ */
+const char* getMotionStateName(MotionState motion) {
+  switch (motion) {
+    case TURNING: return "TURNING";
+    case MOVING: return "MOVING";
+    case STATIC: return "STATIC";
+    default: return "UNKNOWN";
+  }
+}
+
+/**
+ * Pre-initialize filter with static readings
  */
 void initializeFilterOrientation() {
   const int numSamples = 50;
@@ -190,7 +276,6 @@ void initializeFilterOrientation() {
     
     float accelG[3] = {data.accel[0] / G_TO_MPS2, data.accel[1] / G_TO_MPS2, data.accel[2] / G_TO_MPS2};
     
-    // Update with zero gyro (stationary assumption)
     madgwick.update(0, 0, 0, accelG[0], accelG[1], accelG[2], 
                     data.mag[0], data.mag[1], data.mag[2]);
     
@@ -209,12 +294,6 @@ void remapAxes(const float in[3], float out[3], bool invertZ) {
   out[0] = in[1];
   out[1] = -in[0];
   out[2] = invertZ ? -in[2] : in[2];
-}
-
-float normalizeAngle(float angle) {
-  while (angle > 180.0f) angle -= 360.0f;
-  while (angle < -180.0f) angle += 360.0f;
-  return angle;
 }
 
 void printIMUData(const IMUData &data, const Orientation &orient) {
@@ -245,5 +324,12 @@ void printIMUData(const IMUData &data, const Orientation &orient) {
   Serial.println();
   
   Serial.print(F("Yaw:   ")); Serial.print(orient.yaw, 2); Serial.println(F("° (absolute)"));
+  
+  // Show motion state and current beta
+  if (state == READY) {
+    Serial.print(F("Motion: ")); Serial.print(getMotionStateName(motionState));
+    Serial.print(F(" | Beta: ")); Serial.println(currentBeta, 3);
+  }
+  
   Serial.println(F("==========================================\n"));
 }
