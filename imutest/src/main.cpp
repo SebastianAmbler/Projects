@@ -236,18 +236,19 @@ float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float d
 
 /**
  * Calculate yaw from magnetometer with tilt compensation
+ * Inverted X-axis to correct heading offset
  */
 float calculateYaw(float mx, float my, float roll, float pitch) {
   // Convert angles to radians for tilt compensation
   float rollRad = roll * DEG_TO_RAD;
   float pitchRad = pitch * DEG_TO_RAD;
   
-  // Tilt compensation
+  // Tilt compensation with inverted X-axis
   float magX = mx * cos(pitchRad) + my * sin(rollRad) * sin(pitchRad);
   float magY = my * cos(rollRad);
   
-  // Calculate yaw
-  float yaw = atan2(magY, magX);
+  // Calculate yaw with inverted X
+  float yaw = atan2(magY, -magX);
   
   // Apply magnetic declination
   yaw += MAG_DECLINATION_RAD;
