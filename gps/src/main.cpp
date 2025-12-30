@@ -1,28 +1,25 @@
+#include <Arduino.h> // Required for PlatformIO
 #include <TinyGPS++.h>
 
 TinyGPSPlus gps;
 
-// UART2 on ESP32
-HardwareSerial GPS_Serial(2);
+HardwareSerial GPS_Serial(1);
 
-const int GPS_RX = 16;  // ESP32 RX  <- GPS TX
-const int GPS_TX = 17;  // ESP32 TX  -> GPS RX
-const uint32_t GPS_BAUD = 9600; // try 9600 first
+const int GPS_RX = 44;  // ESP32 Pin 44 (U0RXD) connected to GPS TX
+const int GPS_TX = 43;  // ESP32 Pin 43 (U0TXD) connected to GPS RX
+const uint32_t GPS_BAUD = 9600; 
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  Serial.println("Starting GPS...");
+  Serial.println("System Started. Initializing GPS on Pins 43/44...");
   GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
 }
 
 void loop() {
-  // 1) Mirror raw data from GPS to USB serial so you can SEE NMEA
   while (GPS_Serial.available()) {
     char c = GPS_Serial.read();
-    Serial.write(c);      // show raw GPS sentences like $GNGGA,...
-    gps.encode(c);        // feed TinyGPS++
+    
+    gps.encode(c);        
   }
 
   // 2) When location is updated, print parsed info
