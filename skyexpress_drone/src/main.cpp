@@ -1,13 +1,12 @@
 /*
 ====================================================================================
-🛩️  ESP32 Quadcopter Flight Controller with MPU9250 (FreeRTOS) - FIXED VERSION
+🛩️  ESP32-S3 Quadcopter Flight Controller with MPU9250 (SPI + FreeRTOS)
 ====================================================================================
-Integration of tuned MPU9250 sensor with flight controller
-Based on Carbon Aeronautics architecture, adapted for ESP32
+Integrated SPI implementation with tuned calibration data
 ====================================================================================
 */
 
-#include <Wire.h>
+#include <SPI.h>
 #include <Arduino.h>
 #include <PPMReader.h>
 #include "freertos/FreeRTOS.h"
@@ -15,14 +14,17 @@ Based on Carbon Aeronautics architecture, adapted for ESP32
 #include <freertos/semphr.h>
 #include "MPU9250.h"
 
-// ===================== MPU9250 SETUP =====================
-// FIXED: Using I2C interface (address 0x68 or 0x69 depending on AD0 pin)
-MPU9250 IMU(Wire, 0x68);
+// ===================== MPU9250 SPI SETUP =====================
+// ESP32-S3 Default SPI Pins: CS=10, MOSI=11, SCLK=12, MISO=13
+#define SPI_CS_PIN 10
+MPU9250 IMU(SPI, SPI_CS_PIN);
 
-// Calibration constants from your tuned code
+// ===================== CALIBRATION CONSTANTS =====================
+// Updated with values from your provided SPI example
 constexpr float ACCEL_BIAS[3] = {0.22f, 0.20f, -0.13f};
 constexpr float ACCEL_SCALE[3] = {1.00f, 1.00f, 0.99f};
 constexpr float GYRO_BIAS[3] = {0.01f, 0.04f, -0.01f};
+// Magnetometer not currently used in PID, but constants kept for future
 constexpr float MAG_BIAS[3] = {33.17f, 20.35f, -25.80f};
 constexpr float MAG_SCALE[3] = {1.03f, 0.97f, 1.00f};
 
@@ -44,7 +46,7 @@ KalmanState pitchKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 KalmanState rollKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 
 // ===================== MUTEXES =====================
-SemaphoreHandle_t i2cMutex;
+SemaphoreHandle_t spiMutex;
 
 // ===================== CONFIGURATION CONSTANTS =====================
 const float MOTOR_SCALE_FACTOR = 1.024f;
@@ -355,21 +357,21 @@ void reset_pid(void) {
 }
 
 void gyro_signals(void) {
-  if (i2cMutex != NULL) {
-    if (xSemaphoreTake(i2cMutex, (TickType_t)10) == pdTRUE) {
-      // Read MPU9250 sensor
+  if (spiMutex != NULL) {
+    if (xSemaphoreTake(spiMutex, (TickType_t)10) == pdTRUE) {
+      // Read MPU9250 sensor via SPI
       IMU.readSensor();
 
       // Get raw sensor data
       float rawAccel[3] = {IMU.getAccelX_mss(), IMU.getAccelY_mss(), IMU.getAccelZ_mss()};
       float rawGyro[3] = {IMU.getGyroX_rads(), IMU.getGyroY_rads(), IMU.getGyroZ_rads()};
-
+      
       // Apply calibration
       float calAccel[3], calGyro[3];
       calibrateIMU(rawAccel, ACCEL_BIAS, ACCEL_SCALE, calAccel, true);
       calibrateIMU(rawGyro, GYRO_BIAS, nullptr, calGyro);
 
-      // Remap axes to robot frame
+      // Remap axes to robot frame (Matches your previous configuration)
       float tempAccel[3], tempGyro[3];
       remapAxes(calAccel, tempAccel, true);
       remapAxes(calGyro, tempGyro, true);
@@ -388,9 +390,9 @@ void gyro_signals(void) {
       AngleRoll = atan2(AccY, sqrt(AccX * AccX + AccZ * AccZ)) * RAD_TO_DEG;
       AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * RAD_TO_DEG;
 
-      xSemaphoreGive(i2cMutex);
+      xSemaphoreGive(spiMutex);
     } else {
-      Serial.println("I2C mutex busy");
+      Serial.println("SPI mutex busy");
     }
   }
 }
@@ -568,13 +570,13 @@ void setup() {
   while (!Serial && millis() < 3000); // Wait up to 3s for serial
   
   Serial.println(F("\n\n================================="));
-  Serial.println(F("ESP32 Quadcopter Flight Controller"));
+  Serial.println(F("ESP32-S3 Flight Controller (SPI)"));
   Serial.println(F("=================================\n"));
   
-  // Create I2C mutex
-  i2cMutex = xSemaphoreCreateMutex();
-  if (i2cMutex == NULL) {
-    Serial.println("ERROR: Failed to create I2C mutex!");
+  // Create SPI mutex
+  spiMutex = xSemaphoreCreateMutex();
+  if (spiMutex == NULL) {
+    Serial.println("ERROR: Failed to create SPI mutex!");
     while (1) {
       digitalWrite(2, HIGH);
       delay(100);
@@ -587,17 +589,17 @@ void setup() {
   analogReadResolution(12);
   pinMode(analogPin, INPUT);
 
-  // Initialize I2C
-  Wire.begin();
-  Wire.setClock(400000); // 400kHz I2C
-
-  Serial.println(F("Initializing MPU9250..."));
+  // Initialize SPI
+  Serial.println(F("Initializing SPI..."));
+  SPI.begin(); // Uses default S3 pins: CLK=12, MISO=13, MOSI=11, CS=10
+  
+  Serial.println(F("Initializing MPU9250 via SPI..."));
   
   int status = IMU.begin();
   if (status < 0) {
     Serial.print(F("ERROR: IMU initialization failed! Code: "));
     Serial.println(status);
-    Serial.println(F("Check I2C connections and address (0x68 or 0x69)"));
+    Serial.println(F("Check SPI connections (CS Pin 10)"));
     while (1) {
       digitalWrite(2, HIGH);
       delay(250);
@@ -609,7 +611,9 @@ void setup() {
   // Configure IMU
   IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
   IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
-  IMU.setSrd(19); // Sample rate divider for 50 Hz (1000Hz / (1 + 19) = 50Hz)
+  // CHANGED FROM 19 (50Hz) TO 0 (1000Hz)
+  // Your loop runs at 250Hz. The sensor MUST be faster than the loop.
+  IMU.setSrd(0); 
 
   Serial.println(F("IMU initialized successfully!"));
   
