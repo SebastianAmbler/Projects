@@ -1,50 +1,37 @@
+/*
+====================================================================================
+🛩️  ESP32 Quadcopter Flight Controller with MPU9250 (FreeRTOS) - FIXED VERSION
+====================================================================================
+Integration of tuned MPU9250 sensor with flight controller
+Based on Carbon Aeronautics architecture, adapted for ESP32
+====================================================================================
+*/
+
 #include <Wire.h>
+#include <Arduino.h>
+#include <PPMReader.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <freertos/semphr.h>
 #include "MPU9250.h"
 
-MPU9250 IMU(SPI, 10);
+// ===================== MPU9250 SETUP =====================
+// FIXED: Using I2C interface (address 0x68 or 0x69 depending on AD0 pin)
+MPU9250 IMU(Wire, 0x68);
 
-// ===================== CALIBRATION CONSTANTS =====================
+// Calibration constants from your tuned code
 constexpr float ACCEL_BIAS[3] = {0.22f, 0.20f, -0.13f};
 constexpr float ACCEL_SCALE[3] = {1.00f, 1.00f, 0.99f};
-
-// Gyro biases (rad/s)
 constexpr float GYRO_BIAS[3] = {0.01f, 0.04f, -0.01f};
-
-// Magnetometer biases (uT) and scale factors
 constexpr float MAG_BIAS[3] = {33.17f, 20.35f, -25.80f};
 constexpr float MAG_SCALE[3] = {1.03f, 0.97f, 1.00f};
 
-// ===================== CONSTANTS =====================
 constexpr float G_TO_MPS2 = 9.80665f;
-constexpr float SAMPLE_FREQ_HZ = 50.0f;
-constexpr float DT = 1.0f / SAMPLE_FREQ_HZ; // 0.02 seconds
-
-// Magnetic declination for your location: -0° 41'
-constexpr float MAG_DECLINATION_RAD = -0.01193f; // -0.683° in radians
 
 // Kalman filter parameters
-constexpr float Q_ANGLE = 0.001f;  // Process noise variance for accelerometer
-constexpr float Q_BIAS = 0.003f;   // Process noise variance for gyroscope bias
-constexpr float R_MEASURE = 0.03f; // Measurement noise variance
-
-constexpr unsigned long CALIBRATION_TIME_MS = 2000;
-
-// FreeRTOS Configuration
-constexpr uint32_t SENSOR_TASK_STACK = 4096;
-constexpr uint32_t PROCESS_TASK_STACK = 4096;
-constexpr uint32_t PRINT_TASK_STACK = 3072;
-
-// Core assignments (ESP32-S3 has dual cores: 0 and 1)
-constexpr BaseType_t SENSOR_TASK_CORE = 1;   // Time-critical on Core 1
-constexpr BaseType_t PROCESS_TASK_CORE = 1;  // Processing on Core 1
-constexpr BaseType_t PRINT_TASK_CORE = 0;    // I/O on Core 0 (same as Arduino loop)
-
-// ===================== DATA STRUCTURES =====================
-struct IMUData {
-  float accel[3];
-  float gyro[3];
-  float mag[3];
-};
+constexpr float Q_ANGLE = 0.001f;
+constexpr float Q_BIAS = 0.003f;
+constexpr float R_MEASURE = 0.03f;
 
 struct KalmanState {
   float angle;
@@ -53,323 +40,125 @@ struct KalmanState {
   float P[2][2];
 };
 
-struct Orientation {
-  float roll;
-  float pitch;
-  float yaw;
-};
-
-// ===================== STATE VARIABLES =====================
 KalmanState pitchKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 KalmanState rollKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
-Orientation orient = {0, 0, 0};
-Orientation zeroOffset = {0, 0, 0};
 
-IMUData currentData;
-bool isCalibrated = false;
-unsigned long calibrationStartMs = 0;
+// ===================== MUTEXES =====================
+SemaphoreHandle_t i2cMutex;
 
-// ===================== FREERTOS HANDLES =====================
-SemaphoreHandle_t xDataMutex = NULL;
-TaskHandle_t xSensorTaskHandle = NULL;
-TaskHandle_t xProcessTaskHandle = NULL;
-TaskHandle_t xPrintTaskHandle = NULL;
+// ===================== CONFIGURATION CONSTANTS =====================
+const float MOTOR_SCALE_FACTOR = 1.024f;
+const float ANGLE_SCALE_FACTOR = 0.10f;
+const float YAW_RATE_SCALE_FACTOR = 0.15f;
+const int THROTTLE_IDLE = 1180;
+const int THROTTLE_CUTOFF = 1000;
+const int THROTTLE_MAX = 1800;
+const int MOTOR_MAX = 1989;
+const float LOOP_TIME_SEC = 0.004f; // 4ms = 250Hz
 
-// ===================== FUNCTION PROTOTYPES =====================
-void calibrateIMU(float raw[3], const float bias[3], const float scale[3], float output[3], bool isMPS2 = false);
-void remapAxes(const float in[3], float out[3], bool invertZ = false);
-float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float dt);
-float calculateYaw(float mx, float my, float roll, float pitch);
-void printIMUData(const IMUData &data, const Orientation &orient);
-void initializeKalmanFilter();
+// ===================== PID TUNING =====================
+float PRate = 0.08, IRate = 0.04, DRate = 0.001;
+float PAngle = 4, IAngle = 0.04, DAngle = 0.0;
 
-// ===================== FREERTOS TASKS =====================
+// ===================== BATTERY MONITORING =====================
+const int analogPin = 25;
+const float referenceVoltage = 3.3;
+const float r1Value = 77600.0;
+const float r2Value = 29400.0;
+const float BATTERY_WARNING_VOLTAGE = 10.5; // 3.5V per cell for 3S
+const float BATTERY_CRITICAL_VOLTAGE = 9.9; // 3.3V per cell for 3S
+float battery_voltage = 10;
 
-/**
- * Task: Read sensor data at 50 Hz (Core 1)
- */
-void vSensorReadTask(void *pvParameters) {
-  // Wait for signal that all tasks are ready
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(20); // 50 Hz = 20ms period
+// ===================== PWM MOTOR CONTROL =====================
+const int PWM_PIN_M1 = 5;
+const int PWM_PIN_M2 = 18;
+const int PWM_PIN_M3 = 19;
+const int PWM_PIN_M4 = 15;
+const int PWM_FREQUENCY = 250;
+const int PWM_RESOLUTION = 12;
 
-  Serial.println("Sensor Read Task started on Core " + String(xPortGetCoreID()));
+// ===================== PPM RECEIVER =====================
+byte interruptPin = 4;
+byte channelAmount = 6;
+PPMReader ppm(interruptPin, channelAmount);
+int ppmData[6] = {0, 0, 0, 0, 0, 0};
 
-  for (;;) {
-    // Read sensor data
-    IMU.readSensor();
+// PPM timeout
+const unsigned long ppmTimeout = 5000000; // 5 seconds
+unsigned long lastPPMUpdateTime = 0;
+bool ppmSignalLost = true;
+int lastPPMData[6] = {0};
+const int changeThreshold = 10;
 
-    float rawAccel[3] = {IMU.getAccelX_mss(), IMU.getAccelY_mss(), IMU.getAccelZ_mss()};
-    float rawGyro[3] = {IMU.getGyroX_rads(), IMU.getGyroY_rads(), IMU.getGyroZ_rads()};
-    float rawMag[3] = {IMU.getMagX_uT(), IMU.getMagY_uT(), IMU.getMagZ_uT()};
+// ===================== ARMING SYSTEM =====================
+bool isArmed = false;
+unsigned long armingStartTime = 0;
+const unsigned long ARMING_TIME_MS = 2000; // 2 seconds to arm
+bool armingInProgress = false;
 
-    // Apply calibration
-    float calAccel[3], calGyro[3], calMag[3];
-    calibrateIMU(rawAccel, ACCEL_BIAS, ACCEL_SCALE, calAccel, true);
-    calibrateIMU(rawGyro, GYRO_BIAS, nullptr, calGyro);
-    calibrateIMU(rawMag, MAG_BIAS, MAG_SCALE, calMag);
+// ===================== DEBUG FLAGS =====================
+bool enableSerialDebug = false; // Set to true only for ground testing
 
-    // Remap axes to robot frame
-    IMUData tempData;
-    remapAxes(calAccel, tempData.accel, true);
-    remapAxes(calGyro, tempData.gyro, true);
-    remapAxes(calMag, tempData.mag, true);
+// ===================== FLIGHT CONTROL VARIABLES =====================
+float RateRoll, RatePitch, RateYaw;
+float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw;
+int RateCalibrationNumber;
+float AccX, AccY, AccZ;
+float AngleRoll, AnglePitch;
+float LoopTimer;
 
-    // Copy to shared data with mutex protection
-    if (xSemaphoreTake(xDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      memcpy(&currentData, &tempData, sizeof(IMUData));
-      xSemaphoreGive(xDataMutex);
-      
-      // Notify processing task that new data is available
-      xTaskNotifyGive(xProcessTaskHandle);
-    }
+float DesiredRateRoll, DesiredRatePitch, DesiredRateYaw;
+float ErrorRateRoll, ErrorRatePitch, ErrorRateYaw;
+float InputRoll, InputThrottle, InputPitch, InputYaw;
+float PrevErrorRateRoll, PrevErrorRatePitch, PrevErrorRateYaw;
+float PrevItermRateRoll, PrevItermRatePitch, PrevItermRateYaw;
+float PIDReturn[] = {0, 0, 0};
 
-    // Wait for next cycle (maintains precise 50 Hz timing)
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-  }
-}
+// PID Rate
+float PRateRoll = PRate;
+float PRatePitch = PRateRoll;
+float PRateYaw = 0.100;
+float IRateRoll = IRate;
+float IRatePitch = IRateRoll;
+float IRateYaw = 0.030;
+float DRateRoll = DRate;
+float DRatePitch = DRateRoll;
+float DRateYaw = 0.000;
 
-/**
- * Task: Process sensor data (Kalman filtering) (Core 1)
- */
-void vDataProcessTask(void *pvParameters) {
-  // Wait for signal that all tasks are ready
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  
-  Serial.println("Data Process Task started on Core " + String(xPortGetCoreID()));
+float MotorInput1 = 0, MotorInput2 = 0, MotorInput3 = 0, MotorInput4 = 0;
 
-  for (;;) {
-    // Wait for notification from sensor read task (blocks indefinitely)
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+float KalmanAngleRoll = 0, KalmanUncertaintyAngleRoll = 2 * 2;
+float KalmanAnglePitch = 0, KalmanUncertaintyAnglePitch = 2 * 2;
+float Kalman1DOutput[] = {0, 0};
 
-    IMUData localData;
-    
-    // Copy current data with mutex protection
-    if (xSemaphoreTake(xDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      memcpy(&localData, &currentData, sizeof(IMUData));
-      xSemaphoreGive(xDataMutex);
-    } else {
-      continue; // Skip this cycle if we can't get the mutex
-    }
+float DesiredAngleRoll, DesiredAnglePitch;
+float ErrorAngleRoll, ErrorAnglePitch;
+float PrevErrorAngleRoll, PrevErrorAnglePitch;
+float PrevItermAngleRoll, PrevItermAnglePitch;
 
-    // Calculate accelerometer angles
-    float accelPitch = atan2(-localData.accel[0], 
-                            sqrt(localData.accel[1] * localData.accel[1] + 
-                                 localData.accel[2] * localData.accel[2])) * RAD_TO_DEG;
-    float accelRoll = atan2(localData.accel[1], localData.accel[2]) * RAD_TO_DEG;
-
-    // Apply Kalman filter for pitch and roll
-    orient.pitch = kalmanFilter(pitchKalman, localData.gyro[0] * RAD_TO_DEG, accelPitch, DT);
-    orient.roll = kalmanFilter(rollKalman, localData.gyro[1] * RAD_TO_DEG, accelRoll, DT);
-
-    // Calculate yaw from magnetometer with tilt compensation
-    orient.yaw = calculateYaw(localData.mag[0], localData.mag[1], orient.roll, orient.pitch);
-
-    // Apply zero offset after calibration period
-    if (!isCalibrated && (millis() - calibrationStartMs) >= CALIBRATION_TIME_MS) {
-      zeroOffset.roll = orient.roll;
-      zeroOffset.pitch = orient.pitch;
-      isCalibrated = true;
-      Serial.println(F(">>> System ready - Zero offset applied <<<\n"));
-    }
-
-    if (isCalibrated) {
-      orient.roll -= zeroOffset.roll;
-      orient.pitch -= zeroOffset.pitch;
-    }
-  }
-}
-
-/**
- * Task: Print data at 5 Hz (200ms interval) (Core 0)
- */
-void vPrintTask(void *pvParameters) {
-  // Wait for signal that all tasks are ready
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(200); // 5 Hz = 200ms period
-
-  Serial.println("Print Task started on Core " + String(xPortGetCoreID()));
-
-  for (;;) {
-    IMUData localData;
-    Orientation localOrient;
-    bool localCalibrated;
-    unsigned long elapsedMs = millis() - calibrationStartMs;
-
-    // Copy data with mutex protection
-    if (xSemaphoreTake(xDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      memcpy(&localData, &currentData, sizeof(IMUData));
-      memcpy(&localOrient, &orient, sizeof(Orientation));
-      localCalibrated = isCalibrated;
-      xSemaphoreGive(xDataMutex);
-    } else {
-      vTaskDelayUntil(&xLastWakeTime, xFrequency);
-      continue;
-    }
-
-    // Print calibration status
-    if (!localCalibrated) {
-      Serial.print(F("Stabilizing... "));
-      Serial.print((CALIBRATION_TIME_MS - elapsedMs) / 1000.0f, 1);
-      Serial.println(F("s remaining"));
-    }
-
-    // Print IMU data
-    printIMUData(localData, localOrient);
-
-    // Wait for next cycle
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-  }
-}
-
-// ===================== SETUP =====================
-void setup() {
-  Serial.begin(115200);
-  delay(1000); // Give time for serial to initialize
-  
-  Serial.println(F("\n=== ESP32-S3 FreeRTOS IMU System ==="));
-  Serial.printf("Running on Core: %d\n", xPortGetCoreID());
-  Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
-
-  Wire.begin();
-  Wire.setClock(400000);
-
-  Serial.println(F("Initializing MPU9250..."));
-
-  int status = IMU.begin();
-  if (status < 0) {
-    Serial.print(F("IMU initialization failed with code: "));
-    Serial.println(status);
-    while (1) { delay(100); }
-  }
-
-  IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
-  IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
-  IMU.setSrd(19); // Sample rate divider for 50 Hz
-
-  Serial.println(F("IMU Ready!"));
-  Serial.println(F("Calibrating Kalman filter..."));
-  
-  initializeKalmanFilter();
-  
-  calibrationStartMs = millis();
-  Serial.println(F("Calibration complete. Stabilizing for 2 seconds...\n"));
-
-  // Create mutex
-  xDataMutex = xSemaphoreCreateMutex();
-  
-  if (xDataMutex == NULL) {
-    Serial.println(F("Failed to create mutex!"));
-    while (1) { delay(100); }
-  }
-
-  Serial.println(F("Creating FreeRTOS tasks..."));
-
-  // Create sensor read task on Core 1 (time-critical)
-  BaseType_t result = xTaskCreatePinnedToCore(
-    vSensorReadTask,
-    "SensorRead",
-    SENSOR_TASK_STACK,
-    NULL,
-    3,    // Priority (highest)
-    &xSensorTaskHandle,
-    SENSOR_TASK_CORE
-  );
-  
-  if (result != pdPASS) {
-    Serial.println(F("Failed to create Sensor Read Task!"));
-    while (1) { delay(100); }
-  }
-
-  // Create data processing task on Core 1
-  result = xTaskCreatePinnedToCore(
-    vDataProcessTask,
-    "DataProcess",
-    PROCESS_TASK_STACK,
-    NULL,
-    2,    // Priority (medium)
-    &xProcessTaskHandle,
-    PROCESS_TASK_CORE
-  );
-  
-  if (result != pdPASS) {
-    Serial.println(F("Failed to create Data Process Task!"));
-    while (1) { delay(100); }
-  }
-
-  // Create print task on Core 0 (I/O operations)
-  result = xTaskCreatePinnedToCore(
-    vPrintTask,
-    "Print",
-    PRINT_TASK_STACK,
-    NULL,
-    1,    // Priority (lowest)
-    &xPrintTaskHandle,
-    PRINT_TASK_CORE
-  );
-  
-  if (result != pdPASS) {
-    Serial.println(F("Failed to create Print Task!"));
-    while (1) { delay(100); }
-  }
-
-  Serial.println(F("All tasks created successfully!"));
-  Serial.printf("Free Heap after task creation: %d bytes\n\n", ESP.getFreeHeap());
-  
-  // Small delay to ensure all tasks are waiting
-  delay(100);
-  
-  // Signal all tasks to start
-  Serial.println(F("Starting all tasks..."));
-  xTaskNotifyGive(xSensorTaskHandle);
-  xTaskNotifyGive(xProcessTaskHandle);
-  xTaskNotifyGive(xPrintTaskHandle);
-}
-
-// ===================== MAIN LOOP =====================
-void loop() {
-  // Empty - FreeRTOS tasks handle everything
-  // This runs on Core 0 but we're not using it
-  vTaskDelay(pdMS_TO_TICKS(1000));
-}
+// PID Angle
+float PAngleRoll = PAngle;
+float PAnglePitch = PAngleRoll;
+float IAngleRoll = IAngle;
+float IAnglePitch = IAngleRoll;
+float DAngleRoll = DAngle;
+float DAnglePitch = DAngleRoll;
 
 // ===================== HELPER FUNCTIONS =====================
 
-/**
- * Initialize Kalman filter with static readings
- */
-void initializeKalmanFilter() {
-  const int numSamples = 50;
-  
-  for (int i = 0; i < numSamples; i++) {
-    IMU.readSensor();
-    
-    float rawAccel[3] = {IMU.getAccelX_mss(), IMU.getAccelY_mss(), IMU.getAccelZ_mss()};
-    float calAccel[3];
-    calibrateIMU(rawAccel, ACCEL_BIAS, ACCEL_SCALE, calAccel, true);
-    
-    IMUData data;
-    remapAxes(calAccel, data.accel, true);
-    
-    // Initialize with accelerometer angles
-    float accelPitch = atan2(-data.accel[0], sqrt(data.accel[1] * data.accel[1] + 
-                                                   data.accel[2] * data.accel[2])) * RAD_TO_DEG;
-    float accelRoll = atan2(data.accel[1], data.accel[2]) * RAD_TO_DEG;
-    
-    pitchKalman.angle = accelPitch;
-    rollKalman.angle = accelRoll;
-    
-    delay(20);
+void calibrateIMU(float raw[3], const float bias[3], const float scale[3], float output[3], bool isMPS2 = false) {
+  for (int i = 0; i < 3; i++) {
+    float biasValue = isMPS2 ? (bias[i] * G_TO_MPS2) : bias[i];
+    output[i] = (raw[i] - biasValue) * (scale ? scale[i] : 1.0f);
   }
 }
 
-/**
- * Kalman filter implementation for sensor fusion
- */
+void remapAxes(const float in[3], float out[3], bool invertZ = false) {
+  out[0] = in[1];
+  out[1] = -in[0];
+  out[2] = invertZ ? -in[2] : in[2];
+}
+
 float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float dt) {
   // Prediction step
   state.rate = gyroRate - state.bias;
@@ -382,12 +171,12 @@ float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float d
   state.P[1][1] += Q_BIAS * dt;
 
   // Update step
-  float S = state.P[0][0] + R_MEASURE; // Innovation covariance
-  float K[2];                           // Kalman gain
+  float S = state.P[0][0] + R_MEASURE;
+  float K[2];
   K[0] = state.P[0][0] / S;
   K[1] = state.P[1][0] / S;
 
-  float y = accelAngle - state.angle;   // Innovation (measurement residual)
+  float y = accelAngle - state.angle;
   state.angle += K[0] * y;
   state.bias += K[1] * y;
 
@@ -403,81 +192,466 @@ float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float d
   return state.angle;
 }
 
-/**
- * Calculate yaw from magnetometer with tilt compensation
- */
-float calculateYaw(float mx, float my, float roll, float pitch) {
-  // Convert angles to radians for tilt compensation
-  float rollRad = roll * DEG_TO_RAD;
-  float pitchRad = pitch * DEG_TO_RAD;
-  
-  // Tilt compensation with inverted X-axis
-  float magX = mx * cos(pitchRad) + my * sin(rollRad) * sin(pitchRad);
-  float magY = my * cos(rollRad);
-  
-  // Calculate yaw with inverted X
-  float yaw = atan2(magY, -magX);
-  
-  // Apply magnetic declination
-  yaw += MAG_DECLINATION_RAD;
-  
-  // Normalize to 0-360 degrees
-  if (yaw < 0) yaw += 2 * PI;
-  if (yaw > 2 * PI) yaw -= 2 * PI;
-  
-  return yaw * RAD_TO_DEG;
+void reset_motors() {
+  MotorInput1 = THROTTLE_CUTOFF;
+  MotorInput2 = THROTTLE_CUTOFF;
+  MotorInput3 = THROTTLE_CUTOFF;
+  MotorInput4 = THROTTLE_CUTOFF;
 }
 
-/**
- * Apply calibration to raw sensor data
- */
-void calibrateIMU(float raw[3], const float bias[3], const float scale[3], float output[3], bool isMPS2) {
-  for (int i = 0; i < 3; i++) {
-    float biasValue = isMPS2 ? (bias[i] * G_TO_MPS2) : bias[i];
-    output[i] = (raw[i] - biasValue) * (scale ? scale[i] : 1.0f);
+void checkArmingSequence() {
+  // Arming: Throttle LOW + Yaw RIGHT for 2 seconds
+  // Disarming: Throttle LOW + Yaw LEFT for 2 seconds
+  
+  bool throttleLow = ppmData[2] < 1050;
+  bool yawRight = ppmData[3] > 1800;
+  bool yawLeft = ppmData[3] < 1200;
+  
+  if (throttleLow && yawRight && !isArmed) {
+    if (!armingInProgress) {
+      armingInProgress = true;
+      armingStartTime = millis();
+    } else if (millis() - armingStartTime > ARMING_TIME_MS) {
+      isArmed = true;
+      armingInProgress = false;
+      Serial.println("*** ARMED ***");
+    }
+  } else if (throttleLow && yawLeft && isArmed) {
+    if (!armingInProgress) {
+      armingInProgress = true;
+      armingStartTime = millis();
+    } else if (millis() - armingStartTime > ARMING_TIME_MS) {
+      isArmed = false;
+      armingInProgress = false;
+      reset_motors();
+      Serial.println("*** DISARMED ***");
+    }
+  } else {
+    armingInProgress = false;
   }
 }
 
-/**
- * Remap sensor axes to robot frame
- */
-void remapAxes(const float in[3], float out[3], bool invertZ) {
-  out[0] = in[1];
-  out[1] = -in[0];
-  out[2] = invertZ ? -in[2] : in[2];
+void ppmloop() {
+  bool valuesChanged = false;
+
+  for (byte channel = 0; channel < channelAmount; ++channel) {
+    int value = ppm.latestValidChannelValue(channel + 1, -1);
+    if (value != -1) {
+      ppmData[channel] = value;
+      if (abs(ppmData[channel] - lastPPMData[channel]) > changeThreshold) {
+        valuesChanged = true;
+      }
+    }
+    
+    if (enableSerialDebug) {
+      Serial.print(ppmData[channel]);
+      Serial.print("\t");
+    }
+  }
+
+  unsigned long currentTime = micros();
+  unsigned long elapsedTime = currentTime - lastPPMUpdateTime;
+
+  if (valuesChanged) {
+    lastPPMUpdateTime = currentTime;
+    ppmSignalLost = false;
+  } else if (elapsedTime > ppmTimeout) {
+    ppmSignalLost = true;
+  }
+
+  if (enableSerialDebug) {
+    Serial.print(" | Elapsed: ");
+    Serial.print(elapsedTime / 1000000.0);
+    Serial.print(" s | Lost: ");
+    Serial.println(ppmSignalLost ? "Y" : "N");
+  }
+
+  for (byte channel = 0; channel < channelAmount; ++channel) {
+    lastPPMData[channel] = ppmData[channel];
+  }
+
+  if (ppmSignalLost) {
+    if (enableSerialDebug) {
+      Serial.println("PPM Signal Lost! Emergency stop!");
+    }
+    ppmData[2] = THROTTLE_CUTOFF;
+    ppmData[0] = 1500;
+    ppmData[1] = 1500;
+    ppmData[3] = 1500;
+    isArmed = false;
+    reset_pid();
+    reset_motors();
+  }
+  
+  // Check arming/disarming
+  checkArmingSequence();
 }
 
-/**
- * Print formatted IMU data and orientation
- */
-void printIMUData(const IMUData &data, const Orientation &orient) {
-  Serial.println(F("========== IMU Data (Robot Frame) =========="));
-  
-  Serial.print(F("Accel [m/s²]: "));
-  Serial.print(data.accel[0], 3); Serial.print(F("\t"));
-  Serial.print(data.accel[1], 3); Serial.print(F("\t"));
-  Serial.println(data.accel[2], 3);
+void pwmsetup() {
+  pinMode(PWM_PIN_M1, OUTPUT);
+  pinMode(PWM_PIN_M2, OUTPUT);
+  pinMode(PWM_PIN_M3, OUTPUT);
+  pinMode(PWM_PIN_M4, OUTPUT);
 
-  Serial.print(F("Gyro [rad/s]: "));
-  Serial.print(data.gyro[0], 3); Serial.print(F("\t"));
-  Serial.print(data.gyro[1], 3); Serial.print(F("\t"));
-  Serial.println(data.gyro[2], 3);
+  ledcAttach(PWM_PIN_M1, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(PWM_PIN_M2, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(PWM_PIN_M3, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttach(PWM_PIN_M4, PWM_FREQUENCY, PWM_RESOLUTION);
+}
 
-  Serial.print(F("Mag [uT]:     "));
-  Serial.print(data.mag[0], 2); Serial.print(F("\t"));
-  Serial.print(data.mag[1], 2); Serial.print(F("\t"));
-  Serial.println(data.mag[2], 2);
+void pwmloop(int motor_input, int PWM_PIN) {
+  ledcWrite(PWM_PIN, motor_input);
+}
 
-  Serial.println(F("\n--- Orientation (Kalman Filter) ---"));
-  Serial.print(F("Roll:  ")); Serial.print(orient.roll, 2); Serial.print(F("°"));
-  if (!isCalibrated) Serial.print(F(" (not zeroed)"));
-  Serial.println();
+float batteryvoltage() {
+  // Average multiple readings for stability
+  const int samples = 5;
+  int sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(analogPin);
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+  int rawValue = sum / samples;
   
-  Serial.print(F("Pitch: ")); Serial.print(orient.pitch, 2); Serial.print(F("°"));
-  if (!isCalibrated) Serial.print(F(" (not zeroed)"));
-  Serial.println();
+  float voltage = (rawValue / 4095.0) * referenceVoltage;
+  float inputVoltage = voltage * ((r1Value + r2Value) / r2Value);
+  return inputVoltage;
+}
+
+void pid_equation(float Error, float P, float I, float D, float PrevError, float PrevIterm) {
+  float Pterm = P * Error;
+  float Iterm = PrevIterm + I * (Error + PrevError) * LOOP_TIME_SEC / 2;
+
+  if (Iterm > 400)
+    Iterm = 400;
+  else if (Iterm < -400)
+    Iterm = -400;
+
+  float Dterm = D * (Error - PrevError) / LOOP_TIME_SEC;
+  float PIDOutput = Pterm + Iterm + Dterm;
+
+  if (PIDOutput > 400)
+    PIDOutput = 400;
+  else if (PIDOutput < -400)
+    PIDOutput = -400;
+
+  PIDReturn[0] = PIDOutput;
+  PIDReturn[1] = Error;
+  PIDReturn[2] = Iterm;
+}
+
+void reset_pid(void) {
+  PrevErrorRateRoll = 0;
+  PrevErrorRatePitch = 0;
+  PrevErrorRateYaw = 0;
+  PrevItermRateRoll = 0;
+  PrevItermRatePitch = 0;
+  PrevItermRateYaw = 0;
+
+  PrevErrorAngleRoll = 0;
+  PrevErrorAnglePitch = 0;
+  PrevItermAngleRoll = 0;
+  PrevItermAnglePitch = 0;
+}
+
+void gyro_signals(void) {
+  if (i2cMutex != NULL) {
+    if (xSemaphoreTake(i2cMutex, (TickType_t)10) == pdTRUE) {
+      // Read MPU9250 sensor
+      IMU.readSensor();
+
+      // Get raw sensor data
+      float rawAccel[3] = {IMU.getAccelX_mss(), IMU.getAccelY_mss(), IMU.getAccelZ_mss()};
+      float rawGyro[3] = {IMU.getGyroX_rads(), IMU.getGyroY_rads(), IMU.getGyroZ_rads()};
+
+      // Apply calibration
+      float calAccel[3], calGyro[3];
+      calibrateIMU(rawAccel, ACCEL_BIAS, ACCEL_SCALE, calAccel, true);
+      calibrateIMU(rawGyro, GYRO_BIAS, nullptr, calGyro);
+
+      // Remap axes to robot frame
+      float tempAccel[3], tempGyro[3];
+      remapAxes(calAccel, tempAccel, true);
+      remapAxes(calGyro, tempGyro, true);
+
+      // Convert gyro from rad/s to deg/s
+      RateRoll = tempGyro[0] * RAD_TO_DEG;
+      RatePitch = tempGyro[1] * RAD_TO_DEG;
+      RateYaw = tempGyro[2] * RAD_TO_DEG;
+
+      // Accelerometer data (in m/s²)
+      AccX = tempAccel[0];
+      AccY = tempAccel[1];
+      AccZ = tempAccel[2];
+
+      // Calculate angles from accelerometer
+      AngleRoll = atan2(AccY, sqrt(AccX * AccX + AccZ * AccZ)) * RAD_TO_DEG;
+      AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * RAD_TO_DEG;
+
+      xSemaphoreGive(i2cMutex);
+    } else {
+      Serial.println("I2C mutex busy");
+    }
+  }
+}
+
+// ===================== FREERTOS TASKS =====================
+
+void batteryMonitorTask(void *pvParameters) {
+  while (1) {
+    battery_voltage = batteryvoltage();
+    
+    if (battery_voltage < BATTERY_CRITICAL_VOLTAGE) {
+      Serial.println("!!! CRITICAL BATTERY - EMERGENCY LANDING !!!");
+      digitalWrite(2, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(200));
+      digitalWrite(2, LOW);
+      vTaskDelay(pdMS_TO_TICKS(200));
+      
+      // Force disarm after critical voltage
+      isArmed = false;
+      reset_motors();
+      
+    } else if (battery_voltage < BATTERY_WARNING_VOLTAGE) {
+      Serial.println("! Battery Low - Land Soon !");
+      digitalWrite(2, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      digitalWrite(2, LOW);
+      vTaskDelay(pdMS_TO_TICKS(500));
+      
+    } else {
+      digitalWrite(2, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(5000)); // Check every 5 seconds when OK
+    }
+    
+    if (enableSerialDebug) {
+      Serial.print("Battery: ");
+      Serial.print(battery_voltage);
+      Serial.println("V");
+    }
+  }
+}
+
+void flightControlTask(void *pvParameters) {
+  while (1) {
+    gyro_signals();
+    
+    RateRoll -= RateCalibrationRoll;
+    RatePitch -= RateCalibrationPitch;
+    RateYaw -= RateCalibrationYaw;
+
+    // Apply Kalman filter
+    KalmanAngleRoll = kalmanFilter(rollKalman, RateRoll, AngleRoll, LOOP_TIME_SEC);
+    KalmanAnglePitch = kalmanFilter(pitchKalman, RatePitch, AnglePitch, LOOP_TIME_SEC);
+
+    ppmloop();
+    
+    DesiredAngleRoll = ANGLE_SCALE_FACTOR * (ppmData[0] - 1500);
+    DesiredAnglePitch = ANGLE_SCALE_FACTOR * (ppmData[1] - 1500);
+
+    if (enableSerialDebug) {
+      Serial.print(" Roll: ");
+      Serial.print(KalmanAngleRoll);
+      Serial.print(" Pitch: ");
+      Serial.println(KalmanAnglePitch);
+    }
+
+    InputThrottle = ppmData[2];
+    DesiredRateYaw = YAW_RATE_SCALE_FACTOR * (ppmData[3] - 1500);
+    
+    ErrorAngleRoll = DesiredAngleRoll - KalmanAngleRoll;
+    ErrorAnglePitch = DesiredAnglePitch - KalmanAnglePitch;
+
+    pid_equation(ErrorAngleRoll, PAngleRoll, IAngleRoll, DAngleRoll, PrevErrorAngleRoll, PrevItermAngleRoll);
+    DesiredRateRoll = PIDReturn[0];
+    PrevErrorAngleRoll = PIDReturn[1];
+    PrevItermAngleRoll = PIDReturn[2];
+
+    pid_equation(ErrorAnglePitch, PAnglePitch, IAnglePitch, DAnglePitch, PrevErrorAnglePitch, PrevItermAnglePitch);
+    DesiredRatePitch = PIDReturn[0];
+    PrevErrorAnglePitch = PIDReturn[1];
+    PrevItermAnglePitch = PIDReturn[2];
+
+    ErrorRateRoll = DesiredRateRoll - RateRoll;
+    ErrorRatePitch = DesiredRatePitch - RatePitch;
+    ErrorRateYaw = DesiredRateYaw - RateYaw;
+
+    pid_equation(ErrorRateRoll, PRateRoll, IRateRoll, DRateRoll, PrevErrorRateRoll, PrevItermRateRoll);
+    InputRoll = PIDReturn[0];
+    PrevErrorRateRoll = PIDReturn[1];
+    PrevItermRateRoll = PIDReturn[2];
+
+    pid_equation(ErrorRatePitch, PRatePitch, IRatePitch, DRatePitch, PrevErrorRatePitch, PrevItermRatePitch);
+    InputPitch = PIDReturn[0];
+    PrevErrorRatePitch = PIDReturn[1];
+    PrevItermRatePitch = PIDReturn[2];
+
+    pid_equation(ErrorRateYaw, PRateYaw, IRateYaw, DRateYaw, PrevErrorRateYaw, PrevItermRateYaw);
+    InputYaw = PIDReturn[0];
+    PrevErrorRateYaw = PIDReturn[1];
+    PrevItermRateYaw = PIDReturn[2];
+
+    if (InputThrottle > THROTTLE_MAX) InputThrottle = THROTTLE_MAX;
+
+    // Motor mixing for X-configuration quadcopter
+    // M1: Front-Right, M2: Front-Left, M3: Rear-Left, M4: Rear-Right
+    MotorInput1 = MOTOR_SCALE_FACTOR * (InputThrottle - InputRoll - InputPitch - InputYaw);
+    MotorInput2 = MOTOR_SCALE_FACTOR * (InputThrottle - InputRoll + InputPitch + InputYaw);
+    MotorInput3 = MOTOR_SCALE_FACTOR * (InputThrottle + InputRoll + InputPitch - InputYaw);
+    MotorInput4 = MOTOR_SCALE_FACTOR * (InputThrottle + InputRoll - InputPitch + InputYaw);
+
+    // Limit maximum motor output
+    if (MotorInput1 > 2000) MotorInput1 = MOTOR_MAX;
+    if (MotorInput2 > 2000) MotorInput2 = MOTOR_MAX;
+    if (MotorInput3 > 2000) MotorInput3 = MOTOR_MAX;
+    if (MotorInput4 > 2000) MotorInput4 = MOTOR_MAX;
+
+    // Apply minimum throttle when armed
+    if (MotorInput1 < THROTTLE_IDLE) MotorInput1 = THROTTLE_IDLE;
+    if (MotorInput2 < THROTTLE_IDLE) MotorInput2 = THROTTLE_IDLE;
+    if (MotorInput3 < THROTTLE_IDLE) MotorInput3 = THROTTLE_IDLE;
+    if (MotorInput4 < THROTTLE_IDLE) MotorInput4 = THROTTLE_IDLE;
+
+    // Safety: Cut throttle if not armed or throttle stick is low
+    if (!isArmed || ppmData[2] < 1050) {
+      MotorInput1 = THROTTLE_CUTOFF;
+      MotorInput2 = THROTTLE_CUTOFF;
+      MotorInput3 = THROTTLE_CUTOFF;
+      MotorInput4 = THROTTLE_CUTOFF;
+      reset_pid();
+    }
+
+    pwmloop(MotorInput1, PWM_PIN_M1);
+    pwmloop(MotorInput2, PWM_PIN_M2);
+    pwmloop(MotorInput3, PWM_PIN_M3);
+    pwmloop(MotorInput4, PWM_PIN_M4);
+
+    // Maintain 250Hz loop rate (4ms)
+    while ((micros() - LoopTimer) < 4000) {
+      taskYIELD(); // Allow other tasks to run
+    }
+    LoopTimer = micros();
+  }
+}
+
+void gyroscope_calibration() {
+  Serial.println("=== GYROSCOPE CALIBRATION ===");
+  Serial.println("Keep drone LEVEL and STATIONARY!");
+  delay(2000);
   
-  Serial.print(F("Yaw:   ")); Serial.print(orient.yaw, 2); Serial.println(F("° (absolute)"));
+  for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
+    gyro_signals();
+    RateCalibrationRoll += RateRoll;
+    RateCalibrationPitch += RatePitch;
+    RateCalibrationYaw += RateYaw;
+    
+    if (RateCalibrationNumber % 200 == 0) {
+      Serial.print(".");
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
   
-  Serial.println(F("==========================================\n"));
+  RateCalibrationRoll /= 2000;
+  RateCalibrationPitch /= 2000;
+  RateCalibrationYaw /= 2000;
+  
+  Serial.println("\n=== CALIBRATION COMPLETE ===");
+  Serial.print("Roll offset: "); Serial.println(RateCalibrationRoll);
+  Serial.print("Pitch offset: "); Serial.println(RateCalibrationPitch);
+  Serial.print("Yaw offset: "); Serial.println(RateCalibrationYaw);
+}
+
+// ===================== SETUP =====================
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000); // Wait up to 3s for serial
+  
+  Serial.println(F("\n\n================================="));
+  Serial.println(F("ESP32 Quadcopter Flight Controller"));
+  Serial.println(F("=================================\n"));
+  
+  // Create I2C mutex
+  i2cMutex = xSemaphoreCreateMutex();
+  if (i2cMutex == NULL) {
+    Serial.println("ERROR: Failed to create I2C mutex!");
+    while (1) {
+      digitalWrite(2, HIGH);
+      delay(100);
+      digitalWrite(2, LOW);
+      delay(100);
+    }
+  }
+
+  pinMode(2, OUTPUT);
+  analogReadResolution(12);
+  pinMode(analogPin, INPUT);
+
+  // Initialize I2C
+  Wire.begin();
+  Wire.setClock(400000); // 400kHz I2C
+
+  Serial.println(F("Initializing MPU9250..."));
+  
+  int status = IMU.begin();
+  if (status < 0) {
+    Serial.print(F("ERROR: IMU initialization failed! Code: "));
+    Serial.println(status);
+    Serial.println(F("Check I2C connections and address (0x68 or 0x69)"));
+    while (1) {
+      digitalWrite(2, HIGH);
+      delay(250);
+      digitalWrite(2, LOW);
+      delay(250);
+    }
+  }
+
+  // Configure IMU
+  IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
+  IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
+  IMU.setSrd(19); // Sample rate divider for 50 Hz (1000Hz / (1 + 19) = 50Hz)
+
+  Serial.println(F("IMU initialized successfully!"));
+  
+  delay(500);
+  
+  // Calibrate gyroscope
+  gyroscope_calibration();
+  
+  // Setup PWM for motors
+  pwmsetup();
+  reset_motors();
+  
+  LoopTimer = micros();
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(
+    batteryMonitorTask,
+    "BatteryMonitor",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0  // Core 0
+  );
+  
+  xTaskCreatePinnedToCore(
+    flightControlTask,
+    "FlightControl",
+    10240, // Increased stack size
+    NULL,
+    2,     // Higher priority
+    NULL,
+    1      // Core 1
+  );
+
+  Serial.println(F("\n=== FLIGHT CONTROLLER READY ==="));
+  Serial.println(F("ARM: Throttle LOW + Yaw RIGHT for 2s"));
+  Serial.println(F("DISARM: Throttle LOW + Yaw LEFT for 2s"));
+  Serial.println(F("================================\n"));
+}
+
+void loop() {
+  // Empty - FreeRTOS tasks handle everything
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
