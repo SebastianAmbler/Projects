@@ -29,9 +29,9 @@ constexpr float MAG_SCALE[3] = {1.03f, 0.97f, 1.00f};
 constexpr float G_TO_MPS2 = 9.80665f;
 
 // Kalman filter parameters
-constexpr float Q_ANGLE = 0.001f;
+constexpr float Q_ANGLE = 0.002f;
 constexpr float Q_BIAS = 0.003f;
-constexpr float R_MEASURE = 0.03f;
+constexpr float R_MEASURE = 0.02f;
 
 struct KalmanState {
   float angle;
@@ -53,7 +53,7 @@ float PAngle = 4, IAngle = 0.04, DAngle = 0.0;
 // ===================== BATTERY MONITORING =====================
 // CHANGED: GPIO 25 is NOT an ADC on ESP32-S3. Changed to GPIO 1.
 // MOVE YOUR VOLTAGE DIVIDER WIRE TO GPIO 1!
-const int analogPin = 1; 
+const int analogPin = 17; 
 float referenceVoltage = 3.3;
 float r1Value = 77600.0;
 float r2Value = 29400.0;
@@ -69,7 +69,7 @@ const int PWM_RESOLUTION = 12;
 
 // ===================== PPM RECEIVER (FS-iA6B) =====================
 byte ppmInterruptPin = 5;      // PPM input pin (interrupt-capable)
-byte channelAmount = 6;         // FS-iA6B has 6 channels in PPM mode
+byte channelAmount = 8;         // FS-iA6B has 6 channels in PPM mode
 PPMReader* ppm = nullptr;
 int ppmData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000}; // Default safe values
 
@@ -545,11 +545,12 @@ void setup() {
     while (1);
   }
 
+  // ADC Setup for ESP32-S3 (GPIO 1 is valid ADC1_CH0)
   pinMode(2, OUTPUT);
   analogReadResolution(12);
   pinMode(analogPin, INPUT);
 
-  // Initialize PPM Reader
+  // Initialize PPM
   ppm = new PPMReader(ppmInterruptPin, channelAmount);
   Serial.println(F("\n=== PPM Receiver Initialized (FS-iA6B) ==="));
 
@@ -564,7 +565,14 @@ void setup() {
 
   IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
   IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
-  IMU.setSrd(19); // Sample rate divider for 50 Hz
+  
+  // === FIX IS HERE ===
+  // 19 = 50Hz (Too Slow). 0 = 1000Hz (Fastest). 
+  // We want fresh data every 4ms (250Hz), so 0 ensures data is always ready.
+  IMU.setSrd(0); 
+  
+  // Enable Low Pass Filter (DLPF) to smooth out vibration before Kalman
+  IMU.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_41HZ); 
 
   Serial.println(F("IMU Ready!"));
   delay(250);
@@ -575,12 +583,12 @@ void setup() {
   pwmsetup();
   LoopTimer = micros();
 
-  xTaskCreatePinnedToCore(batteryMonitorTask, "Battery monitor Task", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(flightControlTask, "Flight Control Task", 9216, NULL, 1, NULL, 1);
+  // Create Tasks
+  xTaskCreatePinnedToCore(batteryMonitorTask, "Battery", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(flightControlTask, "Flight", 9216, NULL, 2, NULL, 1); // Priority 2 for Flight Task
 
   Serial.println(F("Flight controller ready!"));
 }
-
 void loop() {
   // Empty - FreeRTOS tasks handle everything
 }
