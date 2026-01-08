@@ -39,7 +39,7 @@ Servo motors[NUM_MOTORS];
 int currentThrottle = ESC_MIN;
 
 // Test parameters
-const int TEST_THROTTLE = 1100; // Safe test speed (30% throttle)
+const int TEST_THROTTLE = 1300; // Safe test speed (30% throttle)
 const int RAMP_DELAY = 50;      // Delay for ramp tests
 const int TEST_DURATION = 2000; // Test duration in ms
 

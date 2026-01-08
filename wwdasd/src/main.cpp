@@ -1,21 +1,22 @@
 /*
 ====================================================================================
-🛩️  ESP32 Quadcopter Flight Controller with MPU9250 (FreeRTOS)
+🛩️  ESP32 Quadcopter Flight Controller with MPU9250 (FreeRTOS + PPM)
 ====================================================================================
-Integration of tuned MPU9250 sensor with flight controller
-Based on Carbon Aeronautics architecture, adapted for ESP32
+Integration of tuned MPU9250 sensor with flight controller using PPM receiver
+Fixed: PPM Signal Logic, Level Calibration, S3 ADC Pin, SPI Conflicts
 ====================================================================================
 */
 
 #include <Wire.h>
 #include <Arduino.h>
-#include <IBusBM.h>
+#include <PPMReader.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <freertos/semphr.h>
 #include "MPU9250.h"
 
 // ===================== MPU9250 SETUP =====================
+// NOTE: Ensure your MPU9250 CS pin is connected to GPIO 10 (or change below)
 MPU9250 IMU(SPI, 10);
 
 // Calibration constants from your tuned code
@@ -43,43 +44,47 @@ KalmanState pitchKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 KalmanState rollKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 
 // ===================== MUTEXES =====================
-SemaphoreHandle_t i2cMutex;
+SemaphoreHandle_t sensorMutex;
 
 // ===================== PID TUNING =====================
 float PRate = 0.08, IRate = 0.04, DRate = 0.001;
 float PAngle = 4, IAngle = 0.04, DAngle = 0.0;
 
 // ===================== BATTERY MONITORING =====================
-const int analogPin = 25;
+// CHANGED: GPIO 25 is NOT an ADC on ESP32-S3. Changed to GPIO 1.
+// MOVE YOUR VOLTAGE DIVIDER WIRE TO GPIO 1!
+const int analogPin = 1; 
 float referenceVoltage = 3.3;
 float r1Value = 77600.0;
 float r2Value = 29400.0;
 float battery_voltage = 10;
 
 // ===================== PWM MOTOR CONTROL =====================
-const int PWM_PIN_M1 = 5;   // Motor 1 - Counter-clockwise
-const int PWM_PIN_M2 = 18;  // Motor 2 - Clockwise
-const int PWM_PIN_M3 = 19;  // Motor 3 - Counter-clockwise
-const int PWM_PIN_M4 = 15;  // Motor 4 - Clockwise
+const int PWM_PIN_M1 = 6;   // Motor 1 - Counter-clockwise
+const int PWM_PIN_M2 = 7;  // Motor 2 - Clockwise
+const int PWM_PIN_M3 = 15;  // Motor 3 - Counter-clockwise
+const int PWM_PIN_M4 = 41;  // Motor 4 - Clockwise
 const int PWM_FREQUENCY = 250;
 const int PWM_RESOLUTION = 12;
 
-// ===================== iBUS RECEIVER (FS-iA6B) =====================
-IBusBM ibus;
-const int IBUS_RX_PIN = 16; // RX pin for iBUS (Serial2)
-const int IBUS_TX_PIN = 17; // TX pin for iBUS telemetry (optional)
-int ibusData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000}; // Default safe values
+// ===================== PPM RECEIVER (FS-iA6B) =====================
+byte ppmInterruptPin = 5;      // PPM input pin (interrupt-capable)
+byte channelAmount = 6;         // FS-iA6B has 6 channels in PPM mode
+PPMReader* ppm = nullptr;
+int ppmData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000}; // Default safe values
 
-// iBUS timeout
-const unsigned long ibusTimeout = 1000000; // 1 second timeout
-unsigned long lastIBusUpdateTime = 0;
-bool ibusSignalLost = true;
-int lastIBusData[10] = {0};
-const int changeThreshold = 10;
+// PPM timeout
+const unsigned long ppmTimeout = 2000000; // 2 second timeout
+unsigned long lastPPMUpdateTime = 0;
+bool ppmSignalLost = true;
+int lastPPMData[10] = {0};
 
 // ===================== FLIGHT CONTROL VARIABLES =====================
 float RateRoll, RatePitch, RateYaw;
-float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw;
+// Calibration Offsets
+float RateCalibrationRoll = 0, RateCalibrationPitch = 0, RateCalibrationYaw = 0;
+float AngleCalibrationRoll = 0, AngleCalibrationPitch = 0;
+
 int RateCalibrationNumber;
 float AccX, AccY, AccZ;
 float AngleRoll, AnglePitch;
@@ -123,6 +128,10 @@ float DAngleRoll = DAngle;
 float DAnglePitch = DAngleRoll;
 
 // ===================== HELPER FUNCTIONS =====================
+
+// Forward declarations
+void reset_pid(void);
+void reset_motors();
 
 void calibrateIMU(float raw[3], const float bias[3], const float scale[3], float output[3], bool isMPS2 = false) {
   for (int i = 0; i < 3; i++) {
@@ -177,68 +186,50 @@ void reset_motors() {
   MotorInput4 = 1000;
 }
 
-void ibusloop() {
-  bool valuesChanged = false;
+// Debug counter for reduced serial output
+unsigned long debugCounter = 0;
 
-  // Read all 10 channels (FS-iA6B has 6 physical + 4 virtual on iBUS)
-  for (int channel = 0; channel < 10; channel++) {
-    int value = ibus.readChannel(channel);
+void ppmloop() {
+  unsigned long currentTime = micros();
+  int validChannelCount = 0;
+
+  // Read all channels
+  for (int channel = 0; channel < channelAmount; channel++) {
+    // get value, return 0 if invalid/timed out
+    int value = ppm->latestValidChannelValue(channel + 1, 0); 
     
-    // iBUS returns 1000-2000, or 0 if invalid
-    if (value >= 1000 && value <= 2000) {
-      ibusData[channel] = value;
-      
-      // Check if values have changed significantly
-      if (abs(ibusData[channel] - lastIBusData[channel]) > changeThreshold) {
-        valuesChanged = true;
-      }
+    // Check if the value is within a valid PPM range (e.g., 800us to 2200us)
+    if (value >= 800 && value <= 2200) {
+      ppmData[channel] = value;
+      lastPPMData[channel] = value;
+      validChannelCount++;
     }
   }
 
-  // Print first 6 channels for monitoring
-  Serial.print("iBUS Ch: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.print(ibusData[i]);
-    Serial.print("\t");
+  // === SIGNAL LOSS LOGIC FIXED ===
+  // If we received valid data for at least 4 channels, the link is ALIVE.
+  if (validChannelCount >= 4) {
+    lastPPMUpdateTime = currentTime;
+    ppmSignalLost = false;
   }
-  Serial.print(" | ");
+  
+  // Calculate time since last valid packet
+  unsigned long elapsedTime = currentTime - lastPPMUpdateTime;
 
-  unsigned long currentTime = micros();
-  unsigned long elapsedTime = currentTime - lastIBusUpdateTime;
-
-  // If values change, update timestamp and reset signal lost flag
-  if (valuesChanged) {
-    lastIBusUpdateTime = currentTime;
-    ibusSignalLost = false;
-  }
-  // If no changes for timeout period, consider signal lost
-  else if (elapsedTime > ibusTimeout) {
-    ibusSignalLost = true;
+  if (elapsedTime > ppmTimeout) {
+    ppmSignalLost = true;
   }
 
-  // Print debug information
-  Serial.print("Elapsed: ");
-  Serial.print(elapsedTime / 1000.0); // Convert to milliseconds
-  Serial.print(" ms | Signal Lost: ");
-  Serial.println(ibusSignalLost ? "YES" : "NO");
-
-  // Save current values for next loop
-  for (int channel = 0; channel < 10; channel++) {
-    lastIBusData[channel] = ibusData[channel];
-  }
-
-  // Handle iBUS signal loss
-  if (ibusSignalLost) {
-    Serial.println("⚠️ iBUS Signal Lost! Resetting Controls...");
+  // --- Failsafe ---
+  if (ppmSignalLost) {
+    // Set failsafe values
+    ppmData[0] = 1500;
+    ppmData[1] = 1500;
+    ppmData[2] = 1000; // Throttle down
+    ppmData[3] = 1500;
+    ppmData[4] = 1000;
+    ppmData[5] = 1000;
     
-    // Set to safe values
-    ibusData[0] = 1500; // Roll center
-    ibusData[1] = 1500; // Pitch center
-    ibusData[2] = 1000; // Throttle minimum (CRITICAL)
-    ibusData[3] = 1500; // Yaw center
-    ibusData[4] = 1000; // Aux1
-    ibusData[5] = 1000; // Aux2
-
     reset_pid();
     reset_motors();
   }
@@ -257,10 +248,10 @@ void pwmsetup() {
   ledcSetup(3, PWM_FREQUENCY, PWM_RESOLUTION); // Channel 3 for M4
 
   // Attach pins to channels
-  ledcAttachPin(PWM_PIN_M1, 0); // Attach GPIO 5 to channel 0
-  ledcAttachPin(PWM_PIN_M2, 1); // Attach GPIO 18 to channel 1
-  ledcAttachPin(PWM_PIN_M3, 2); // Attach GPIO 19 to channel 2
-  ledcAttachPin(PWM_PIN_M4, 3); // Attach GPIO 15 to channel 3
+  ledcAttachPin(PWM_PIN_M1, 0); 
+  ledcAttachPin(PWM_PIN_M2, 1); 
+  ledcAttachPin(PWM_PIN_M3, 2); 
+  ledcAttachPin(PWM_PIN_M4, 3); 
 }
 
 void pwmloop(int motor_input, int PWM_PIN) {
@@ -319,8 +310,8 @@ void reset_pid(void) {
 }
 
 void gyro_signals(void) {
-  if (i2cMutex != NULL) {
-    if (xSemaphoreTake(i2cMutex, (TickType_t)10) == pdTRUE) {
+  if (sensorMutex != NULL) {
+    if (xSemaphoreTake(sensorMutex, (TickType_t)10) == pdTRUE) {
       // Read MPU9250 sensor
       IMU.readSensor();
 
@@ -352,57 +343,127 @@ void gyro_signals(void) {
       AngleRoll = atan2(AccY, sqrt(AccX * AccX + AccZ * AccZ)) * RAD_TO_DEG;
       AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * RAD_TO_DEG;
 
-      xSemaphoreGive(i2cMutex);
-    } else {
-      Serial.println("I2C mutex busy");
+      xSemaphoreGive(sensorMutex);
     }
-  } else {
-    Serial.println("I2C mutex not created");
   }
+}
+
+// ===================== CALIBRATION FUNCTION =====================
+void gyroscope_calibration() {
+  Serial.println("=== CALIBRATING GYRO & LEVEL ===");
+  digitalWrite(2, HIGH); 
+
+  RateCalibrationRoll = 0;
+  RateCalibrationPitch = 0;
+  RateCalibrationYaw = 0;
+  AngleCalibrationRoll = 0;
+  AngleCalibrationPitch = 0;
+
+  for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
+    gyro_signals();
+    
+    // Accumulate Gyro (Speed)
+    RateCalibrationRoll += RateRoll;
+    RateCalibrationPitch += RatePitch;
+    RateCalibrationYaw += RateYaw;
+    
+    // Accumulate Angle (Position)
+    AngleCalibrationRoll += AngleRoll;
+    AngleCalibrationPitch += AnglePitch;
+    
+    vTaskDelay(pdMS_TO_TICKS(1)); 
+  }
+
+  // Calculate Averages
+  RateCalibrationRoll /= 2000;
+  RateCalibrationPitch /= 2000;
+  RateCalibrationYaw /= 2000;
+  
+  AngleCalibrationRoll /= 2000;
+  AngleCalibrationPitch /= 2000;
+
+  digitalWrite(2, LOW);
+  
+  Serial.print("Gyro Offsets -> R: "); Serial.print(RateCalibrationRoll);
+  Serial.print(" P: "); Serial.println(RateCalibrationPitch);
+  Serial.print("Level Offsets -> R: "); Serial.print(AngleCalibrationRoll);
+  Serial.print(" P: "); Serial.println(AngleCalibrationPitch);
 }
 
 // ===================== FREERTOS TASKS =====================
 
 void batteryMonitorTask(void *pvParameters) {
   while (1) {
-    Serial.print("\nBATTERY MONITOR TASK\n");
     battery_voltage = batteryvoltage();
     if (battery_voltage < 9) {
-      Serial.println("Battery level low please Recharge the Battery");
-      digitalWrite(2, HIGH);
-      delay(500);
-      digitalWrite(2, LOW);
-      delay(500);
+      Serial.println("⚠️  Battery level low - please Recharge!");
+      // Flash SOS or similar
+      digitalWrite(2, HIGH); vTaskDelay(pdMS_TO_TICKS(100));
+      digitalWrite(2, LOW); vTaskDelay(pdMS_TO_TICKS(100));
     } else {
-      digitalWrite(2, HIGH);
+      // Heartbeat blink
+      digitalWrite(2, HIGH); vTaskDelay(pdMS_TO_TICKS(50));
+      digitalWrite(2, LOW); vTaskDelay(pdMS_TO_TICKS(5000));
     }
   }
 }
 
 void flightControlTask(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(4); // 4ms = 250Hz loop
+  
+  bool previousCh5State = false;
+
   while (1) {
+    // 1. Read Sensors and Radio
     gyro_signals();
-    
+    ppmloop(); 
+
+    // ================== CALIBRATION LOGIC (Channel 5) ==================
+    bool currentCh5State = ppmData[4] > 1800; // Aux 1 is ON
+    bool isThrottleLow = ppmData[2] < 1050;   // Throttle is LOW
+
+    if (currentCh5State && !previousCh5State && isThrottleLow) {
+      reset_motors();
+      pwmloop(1000, PWM_PIN_M1); pwmloop(1000, PWM_PIN_M2);
+      pwmloop(1000, PWM_PIN_M3); pwmloop(1000, PWM_PIN_M4);
+      
+      gyroscope_calibration(); // Run calibration
+      
+      reset_pid();
+      xLastWakeTime = xTaskGetTickCount(); // Reset loop timer
+    }
+    previousCh5State = currentCh5State;
+    // ===================================================================
+
+    // Apply Gyro Calibration
     RateRoll -= RateCalibrationRoll;
     RatePitch -= RateCalibrationPitch;
     RateYaw -= RateCalibrationYaw;
 
-    // Apply Kalman filter using your tuned implementation
+    // Apply Level Calibration (Zero the accelerometer)
+    AngleRoll -= AngleCalibrationRoll;
+    AnglePitch -= AngleCalibrationPitch;
+
+    // Apply Kalman filter
     KalmanAngleRoll = kalmanFilter(rollKalman, RateRoll, AngleRoll, 0.004);
     KalmanAnglePitch = kalmanFilter(pitchKalman, RatePitch, AnglePitch, 0.004);
 
-    ibusloop(); // Changed from ppmloop()
-    
-    DesiredAngleRoll = 0.10 * (ibusData[0] - 1500);    // Roll
-    DesiredAnglePitch = 0.10 * (ibusData[1] - 1500);  // Pitch
+    // ================== DEBUG PRINTING ==================
+    debugCounter++;
+    if (debugCounter % 50 == 0) {
+      Serial.print("Roll: ");
+      Serial.print(KalmanAngleRoll, 1);
+      Serial.print("° | Pitch: ");
+      Serial.print(KalmanAnglePitch, 1);
+      Serial.println("°");
+    }
 
-    Serial.print(" Roll Angle [°] ");
-    Serial.print(KalmanAngleRoll);
-    Serial.print(" Pitch Angle [°] ");
-    Serial.println(KalmanAnglePitch);
+    DesiredAngleRoll = 0.10 * (ppmData[0] - 1500);    
+    DesiredAnglePitch = 0.10 * (ppmData[1] - 1500);  
 
-    InputThrottle = ibusData[2];                      // Throttle
-    DesiredRateYaw = 0.15 * (ibusData[3] - 1500);    // Yaw
+    InputThrottle = ppmData[2];                      
+    DesiredRateYaw = 0.15 * (ppmData[3] - 1500);    
     
     ErrorAngleRoll = DesiredAngleRoll - KalmanAngleRoll;
     ErrorAnglePitch = DesiredAnglePitch - KalmanAnglePitch;
@@ -455,7 +516,8 @@ void flightControlTask(void *pvParameters) {
     if (MotorInput4 < ThrottleIdle) MotorInput4 = ThrottleIdle;
 
     int ThrottleCutOff = 1000;
-    if (ibusData[2] < 1050) {  // Changed from ppmData[2]
+    // Safety check - if throttle is low, cut motors
+    if (ppmData[2] < 1050) {
       MotorInput1 = ThrottleCutOff;
       MotorInput2 = ThrottleCutOff;
       MotorInput3 = ThrottleCutOff;
@@ -468,34 +530,18 @@ void flightControlTask(void *pvParameters) {
     pwmloop(MotorInput3, PWM_PIN_M3);
     pwmloop(MotorInput4, PWM_PIN_M4);
 
-    while ((micros() - LoopTimer) < 4000);
-    LoopTimer = micros();
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
-}
-
-void gyroscope_calibration() {
-  Serial.println("Starting gyroscope calibration...");
-  for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
-    gyro_signals();
-    RateCalibrationRoll += RateRoll;
-    RateCalibrationPitch += RatePitch;
-    RateCalibrationYaw += RateYaw;
-    delay(1);
-  }
-  RateCalibrationRoll /= 2000;
-  RateCalibrationPitch /= 2000;
-  RateCalibrationYaw /= 2000;
-  Serial.println("Gyroscope calibration complete!");
 }
 
 // ===================== SETUP =====================
 
 void setup() {
-  i2cMutex = xSemaphoreCreateMutex();
+  sensorMutex = xSemaphoreCreateMutex();
   Serial.begin(115200);
   
-  if (i2cMutex == NULL) {
-    Serial.println("Failed to create I2C mutex!");
+  if (sensorMutex == NULL) {
+    Serial.println("Failed to create sensor mutex!");
     while (1);
   }
 
@@ -503,23 +549,17 @@ void setup() {
   analogReadResolution(12);
   pinMode(analogPin, INPUT);
 
-  // Initialize iBUS on Serial2
-  Serial2.begin(115200, SERIAL_8N1, IBUS_RX_PIN, IBUS_TX_PIN);
-  ibus.begin(Serial2);
-  Serial.println(F("\n=== iBUS Receiver Initialized (FS-iA6B) ==="));
+  // Initialize PPM Reader
+  ppm = new PPMReader(ppmInterruptPin, channelAmount);
+  Serial.println(F("\n=== PPM Receiver Initialized (FS-iA6B) ==="));
 
-  Wire.begin();
-  Wire.setClock(400000);
-
-  Serial.println(F("=== Initializing MPU9250 ==="));
-  
+  // Initialize MPU9250
+  Serial.println(F("=== Initializing MPU9250 (SPI) ==="));
   int status = IMU.begin();
   if (status < 0) {
     Serial.print(F("IMU initialization failed with code: "));
     Serial.println(status);
-    while (1) {
-      delay(100);
-    }
+    while (1) delay(100);
   }
 
   IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
@@ -527,17 +567,18 @@ void setup() {
   IMU.setSrd(19); // Sample rate divider for 50 Hz
 
   Serial.println(F("IMU Ready!"));
-  
   delay(250);
   
+  // Initial Calibration
   gyroscope_calibration();
+  
   pwmsetup();
   LoopTimer = micros();
 
   xTaskCreatePinnedToCore(batteryMonitorTask, "Battery monitor Task", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(flightControlTask, "Flight Control Task", 9216, NULL, 1, NULL, 1);
 
-  Serial.println(F("Flight controller ready with iBUS!"));
+  Serial.println(F("Flight controller ready!"));
 }
 
 void loop() {
