@@ -3,7 +3,18 @@
 🛩️  ESP32 Quadcopter Flight Controller with MPU9250 (FreeRTOS + PPM)
 ====================================================================================
 Integration of tuned MPU9250 sensor with flight controller using PPM receiver
-Fixed: PPM Signal Logic, Level Calibration, S3 ADC Pin, SPI Conflicts
+Fixed: Motor Mixing, PPM Signal Logic, Level Calibration, GPIO Pins, ESC Arming
+====================================================================================
+Motor Layout:
+        FRONT
+          ↑
+    M1(CW)    M2(CCW)
+        \   /
+         \ /
+          X
+         / \
+        /   \
+    M3(CCW)   M4(CW)
 ====================================================================================
 */
 
@@ -14,9 +25,9 @@ Fixed: PPM Signal Logic, Level Calibration, S3 ADC Pin, SPI Conflicts
 #include "freertos/task.h"
 #include <freertos/semphr.h>
 #include "MPU9250.h"
+#define RGB_LED_PIN 38
 
 // ===================== MPU9250 SETUP =====================
-// NOTE: Ensure your MPU9250 CS pin is connected to GPIO 10 (or change below)
 MPU9250 IMU(SPI, 10);
 
 // Calibration constants from your tuned code
@@ -51,37 +62,36 @@ float PRate = 0.08, IRate = 0.04, DRate = 0.001;
 float PAngle = 4, IAngle = 0.04, DAngle = 0.0;
 
 // ===================== BATTERY MONITORING =====================
-// CHANGED: GPIO 25 is NOT an ADC on ESP32-S3. Changed to GPIO 1.
-// MOVE YOUR VOLTAGE DIVIDER WIRE TO GPIO 1!
-const int analogPin = 17; 
+const int analogPin = 2; 
 float referenceVoltage = 3.3;
-float r1Value = 77600.0;
-float r2Value = 29400.0;
+float r1Value = 100000.0;
+float r2Value = 27000.0;
 float battery_voltage = 10;
 
 // ===================== PWM MOTOR CONTROL =====================
-const int PWM_PIN_M1 = 6;   // Motor 1 - Counter-clockwise
-const int PWM_PIN_M2 = 7;  // Motor 2 - Clockwise
-const int PWM_PIN_M3 = 15;  // Motor 3 - Counter-clockwise
-const int PWM_PIN_M4 = 41;  // Motor 4 - Clockwise
-const int PWM_FREQUENCY = 250;
+// CRITICAL FIX: GPIO 1 is UART TX - causes ESC arming issues!
+// Changed Motor 2 from GPIO 1 to GPIO 4 (safe pin)
+const int PWM_PIN_M1 = 15;   // Front Left - CW
+const int PWM_PIN_M2 = 1;    // Front Right - CCW (CHANGED from GPIO 1)
+const int PWM_PIN_M3 = 7;    // Rear Left - CCW
+const int PWM_PIN_M4 = 6;    // Rear Right - CW
+const int PWM_FREQUENCY = 250;  
 const int PWM_RESOLUTION = 12;
 
 // ===================== PPM RECEIVER (FS-iA6B) =====================
-byte ppmInterruptPin = 5;      // PPM input pin (interrupt-capable)
-byte channelAmount = 8;         // FS-iA6B has 6 channels in PPM mode
+byte ppmInterruptPin = 5;
+byte channelAmount = 8;
 PPMReader* ppm = nullptr;
-int ppmData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000}; // Default safe values
+int ppmData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000};
 
 // PPM timeout
-const unsigned long ppmTimeout = 2000000; // 2 second timeout
+const unsigned long ppmTimeout = 2000000;
 unsigned long lastPPMUpdateTime = 0;
 bool ppmSignalLost = true;
 int lastPPMData[10] = {0};
 
 // ===================== FLIGHT CONTROL VARIABLES =====================
 float RateRoll, RatePitch, RateYaw;
-// Calibration Offsets
 float RateCalibrationRoll = 0, RateCalibrationPitch = 0, RateCalibrationYaw = 0;
 float AngleCalibrationRoll = 0, AngleCalibrationPitch = 0;
 
@@ -129,7 +139,6 @@ float DAnglePitch = DAngleRoll;
 
 // ===================== HELPER FUNCTIONS =====================
 
-// Forward declarations
 void reset_pid(void);
 void reset_motors();
 
@@ -147,17 +156,14 @@ void remapAxes(const float in[3], float out[3], bool invertZ = false) {
 }
 
 float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float dt) {
-  // Prediction step
   state.rate = gyroRate - state.bias;
   state.angle += dt * state.rate;
 
-  // Update error covariance matrix
   state.P[0][0] += dt * (dt * state.P[1][1] - state.P[0][1] - state.P[1][0] + Q_ANGLE);
   state.P[0][1] -= dt * state.P[1][1];
   state.P[1][0] -= dt * state.P[1][1];
   state.P[1][1] += Q_BIAS * dt;
 
-  // Update step
   float S = state.P[0][0] + R_MEASURE;
   float K[2];
   K[0] = state.P[0][0] / S;
@@ -167,7 +173,6 @@ float kalmanFilter(KalmanState &state, float gyroRate, float accelAngle, float d
   state.angle += K[0] * y;
   state.bias += K[1] * y;
 
-  // Update error covariance matrix
   float P00_temp = state.P[0][0];
   float P01_temp = state.P[0][1];
 
@@ -186,19 +191,15 @@ void reset_motors() {
   MotorInput4 = 1000;
 }
 
-// Debug counter for reduced serial output
 unsigned long debugCounter = 0;
 
 void ppmloop() {
   unsigned long currentTime = micros();
   int validChannelCount = 0;
 
-  // Read all channels
   for (int channel = 0; channel < channelAmount; channel++) {
-    // get value, return 0 if invalid/timed out
     int value = ppm->latestValidChannelValue(channel + 1, 0); 
     
-    // Check if the value is within a valid PPM range (e.g., 800us to 2200us)
     if (value >= 800 && value <= 2200) {
       ppmData[channel] = value;
       lastPPMData[channel] = value;
@@ -206,26 +207,21 @@ void ppmloop() {
     }
   }
 
-  // === SIGNAL LOSS LOGIC FIXED ===
-  // If we received valid data for at least 4 channels, the link is ALIVE.
   if (validChannelCount >= 4) {
     lastPPMUpdateTime = currentTime;
     ppmSignalLost = false;
   }
   
-  // Calculate time since last valid packet
   unsigned long elapsedTime = currentTime - lastPPMUpdateTime;
 
   if (elapsedTime > ppmTimeout) {
     ppmSignalLost = true;
   }
 
-  // --- Failsafe ---
   if (ppmSignalLost) {
-    // Set failsafe values
     ppmData[0] = 1500;
     ppmData[1] = 1500;
-    ppmData[2] = 1000; // Throttle down
+    ppmData[2] = 1000;
     ppmData[3] = 1500;
     ppmData[4] = 1000;
     ppmData[5] = 1000;
@@ -241,13 +237,11 @@ void pwmsetup() {
   pinMode(PWM_PIN_M3, OUTPUT);
   pinMode(PWM_PIN_M4, OUTPUT);
 
-  // Setup PWM channels (compatible with ESP32 core 2.x)
-  ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION); // Channel 0 for M1
-  ledcSetup(1, PWM_FREQUENCY, PWM_RESOLUTION); // Channel 1 for M2
-  ledcSetup(2, PWM_FREQUENCY, PWM_RESOLUTION); // Channel 2 for M3
-  ledcSetup(3, PWM_FREQUENCY, PWM_RESOLUTION); // Channel 3 for M4
+  ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(1, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(2, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(3, PWM_FREQUENCY, PWM_RESOLUTION);
 
-  // Attach pins to channels
   ledcAttachPin(PWM_PIN_M1, 0); 
   ledcAttachPin(PWM_PIN_M2, 1); 
   ledcAttachPin(PWM_PIN_M3, 2); 
@@ -255,15 +249,19 @@ void pwmsetup() {
 }
 
 void pwmloop(int motor_input, int PWM_PIN) {
-  // Map GPIO pin to PWM channel
   int channel;
   if (PWM_PIN == PWM_PIN_M1) channel = 0;
   else if (PWM_PIN == PWM_PIN_M2) channel = 1;
   else if (PWM_PIN == PWM_PIN_M3) channel = 2;
   else if (PWM_PIN == PWM_PIN_M4) channel = 3;
-  else return; // Invalid pin
+  else return;
   
-  ledcWrite(channel, motor_input);
+  // Convert microseconds (1000-2000) to 12-bit duty cycle (0-4095)
+  // PWM period at 250Hz = 4000μs
+  int dutyCycle = map(motor_input, 0, 4000, 0, 4095);
+  dutyCycle = constrain(dutyCycle, 0, 4095);
+  
+  ledcWrite(channel, dutyCycle);
 }
 
 float batteryvoltage() {
@@ -312,34 +310,27 @@ void reset_pid(void) {
 void gyro_signals(void) {
   if (sensorMutex != NULL) {
     if (xSemaphoreTake(sensorMutex, (TickType_t)10) == pdTRUE) {
-      // Read MPU9250 sensor
       IMU.readSensor();
 
-      // Get raw sensor data
       float rawAccel[3] = {IMU.getAccelX_mss(), IMU.getAccelY_mss(), IMU.getAccelZ_mss()};
       float rawGyro[3] = {IMU.getGyroX_rads(), IMU.getGyroY_rads(), IMU.getGyroZ_rads()};
 
-      // Apply calibration
       float calAccel[3], calGyro[3];
       calibrateIMU(rawAccel, ACCEL_BIAS, ACCEL_SCALE, calAccel, true);
       calibrateIMU(rawGyro, GYRO_BIAS, nullptr, calGyro);
 
-      // Remap axes to robot frame
       float tempAccel[3], tempGyro[3];
       remapAxes(calAccel, tempAccel, true);
       remapAxes(calGyro, tempGyro, true);
 
-      // Convert gyro from rad/s to deg/s
       RateRoll = tempGyro[0] * RAD_TO_DEG;
       RatePitch = tempGyro[1] * RAD_TO_DEG;
       RateYaw = tempGyro[2] * RAD_TO_DEG;
 
-      // Accelerometer data (in m/s²)
       AccX = tempAccel[0];
       AccY = tempAccel[1];
       AccZ = tempAccel[2];
 
-      // Calculate angles from accelerometer
       AngleRoll = atan2(AccY, sqrt(AccX * AccX + AccZ * AccZ)) * RAD_TO_DEG;
       AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * RAD_TO_DEG;
 
@@ -348,7 +339,6 @@ void gyro_signals(void) {
   }
 }
 
-// ===================== CALIBRATION FUNCTION =====================
 void gyroscope_calibration() {
   Serial.println("=== CALIBRATING GYRO & LEVEL ===");
   digitalWrite(2, HIGH); 
@@ -362,19 +352,16 @@ void gyroscope_calibration() {
   for (RateCalibrationNumber = 0; RateCalibrationNumber < 2000; RateCalibrationNumber++) {
     gyro_signals();
     
-    // Accumulate Gyro (Speed)
     RateCalibrationRoll += RateRoll;
     RateCalibrationPitch += RatePitch;
     RateCalibrationYaw += RateYaw;
     
-    // Accumulate Angle (Position)
     AngleCalibrationRoll += AngleRoll;
     AngleCalibrationPitch += AnglePitch;
     
     vTaskDelay(pdMS_TO_TICKS(1)); 
   }
 
-  // Calculate Averages
   RateCalibrationRoll /= 2000;
   RateCalibrationPitch /= 2000;
   RateCalibrationYaw /= 2000;
@@ -394,62 +381,58 @@ void gyroscope_calibration() {
 
 void batteryMonitorTask(void *pvParameters) {
   while (1) {
-    battery_voltage = batteryvoltage();
-    if (battery_voltage < 9) {
+    battery_voltage = batteryvoltage(); 
+    if (battery_voltage < 11) {
       Serial.println("⚠️  Battery level low - please Recharge!");
-      // Flash SOS or similar
-      digitalWrite(2, HIGH); vTaskDelay(pdMS_TO_TICKS(100));
-      digitalWrite(2, LOW); vTaskDelay(pdMS_TO_TICKS(100));
+      neopixelWrite(RGB_LED_PIN, 80, 0, 0);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      neopixelWrite(RGB_LED_PIN, 0, 0, 0); 
+      vTaskDelay(pdMS_TO_TICKS(1000));
+
     } else {
-      // Heartbeat blink
-      digitalWrite(2, HIGH); vTaskDelay(pdMS_TO_TICKS(50));
-      digitalWrite(2, LOW); vTaskDelay(pdMS_TO_TICKS(5000));
+      neopixelWrite(RGB_LED_PIN, 0, 80, 0);
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      neopixelWrite(RGB_LED_PIN, 0, 0, 0); 
+      vTaskDelay(pdMS_TO_TICKS(1000));
     }
   }
 }
 
 void flightControlTask(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(4); // 4ms = 250Hz loop
+  const TickType_t xFrequency = pdMS_TO_TICKS(4);
   
   bool previousCh5State = false;
 
   while (1) {
-    // 1. Read Sensors and Radio
     gyro_signals();
     ppmloop(); 
 
-    // ================== CALIBRATION LOGIC (Channel 5) ==================
-    bool currentCh5State = ppmData[4] > 1800; // Aux 1 is ON
-    bool isThrottleLow = ppmData[2] < 1050;   // Throttle is LOW
+    bool currentCh5State = ppmData[4] > 1800;
+    bool isThrottleLow = ppmData[2] < 1050;
 
     if (currentCh5State && !previousCh5State && isThrottleLow) {
       reset_motors();
       pwmloop(1000, PWM_PIN_M1); pwmloop(1000, PWM_PIN_M2);
       pwmloop(1000, PWM_PIN_M3); pwmloop(1000, PWM_PIN_M4);
       
-      gyroscope_calibration(); // Run calibration
+      gyroscope_calibration();
       
       reset_pid();
-      xLastWakeTime = xTaskGetTickCount(); // Reset loop timer
+      xLastWakeTime = xTaskGetTickCount();
     }
     previousCh5State = currentCh5State;
-    // ===================================================================
 
-    // Apply Gyro Calibration
     RateRoll -= RateCalibrationRoll;
     RatePitch -= RateCalibrationPitch;
     RateYaw -= RateCalibrationYaw;
 
-    // Apply Level Calibration (Zero the accelerometer)
     AngleRoll -= AngleCalibrationRoll;
     AnglePitch -= AngleCalibrationPitch;
 
-    // Apply Kalman filter
     KalmanAngleRoll = kalmanFilter(rollKalman, RateRoll, AngleRoll, 0.004);
     KalmanAnglePitch = kalmanFilter(pitchKalman, RatePitch, AnglePitch, 0.004);
 
-    // ================== DEBUG PRINTING ==================
     debugCounter++;
     if (debugCounter % 50 == 0) {
       Serial.print("Roll: ");
@@ -499,10 +482,16 @@ void flightControlTask(void *pvParameters) {
 
     if (InputThrottle > 1800) InputThrottle = 1800;
 
-    MotorInput1 = 1.024 * (InputThrottle - InputRoll - InputPitch - InputYaw);
-    MotorInput2 = 1.024 * (InputThrottle - InputRoll + InputPitch + InputYaw);
+    // === CORRECTED MOTOR MIXING FOR YOUR LAYOUT ===
+    // M1: Front Left (CW)    - Roll+ Pitch- Yaw+
+    // M2: Front Right (CCW)  - Roll- Pitch- Yaw-
+    // M3: Rear Left (CCW)    - Roll+ Pitch+ Yaw-
+    // M4: Rear Right (CW)    - Roll- Pitch+ Yaw+
+    
+    MotorInput1 = 1.024 * (InputThrottle + InputRoll - InputPitch + InputYaw);
+    MotorInput2 = 1.024 * (InputThrottle - InputRoll - InputPitch - InputYaw);
     MotorInput3 = 1.024 * (InputThrottle + InputRoll + InputPitch - InputYaw);
-    MotorInput4 = 1.024 * (InputThrottle + InputRoll - InputPitch + InputYaw);
+    MotorInput4 = 1.024 * (InputThrottle - InputRoll + InputPitch + InputYaw);
 
     if (MotorInput1 > 2000) MotorInput1 = 1989;
     if (MotorInput2 > 2000) MotorInput2 = 1989;
@@ -516,7 +505,6 @@ void flightControlTask(void *pvParameters) {
     if (MotorInput4 < ThrottleIdle) MotorInput4 = ThrottleIdle;
 
     int ThrottleCutOff = 1000;
-    // Safety check - if throttle is low, cut motors
     if (ppmData[2] < 1050) {
       MotorInput1 = ThrottleCutOff;
       MotorInput2 = ThrottleCutOff;
@@ -537,6 +525,32 @@ void flightControlTask(void *pvParameters) {
 // ===================== SETUP =====================
 
 void setup() {
+  // === STEP 1: SETUP PWM IMMEDIATELY (BEFORE SERIAL!) ===
+  // This prevents UART noise on GPIO 1 from interfering with ESCs
+  pinMode(PWM_PIN_M1, OUTPUT);
+  pinMode(PWM_PIN_M2, OUTPUT);
+  pinMode(PWM_PIN_M3, OUTPUT);
+  pinMode(PWM_PIN_M4, OUTPUT);
+
+  ledcSetup(0, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(1, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(2, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(3, PWM_FREQUENCY, PWM_RESOLUTION);
+
+  ledcAttachPin(PWM_PIN_M1, 0); 
+  ledcAttachPin(PWM_PIN_M2, 1); 
+  ledcAttachPin(PWM_PIN_M3, 2); 
+  ledcAttachPin(PWM_PIN_M4, 3);
+  
+  // Send 1000μs immediately (1024 = 25% of 4095 at 250Hz)
+  ledcWrite(0, 1024);
+  ledcWrite(1, 1024);
+  ledcWrite(2, 1024);
+  ledcWrite(3, 1024);
+  
+  delay(3000); // CRITICAL: Wait for ESCs to detect arming signal
+  
+  // === STEP 2: NOW initialize Serial and other components ===
   sensorMutex = xSemaphoreCreateMutex();
   Serial.begin(115200);
   
@@ -545,16 +559,15 @@ void setup() {
     while (1);
   }
 
-  // ADC Setup for ESP32-S3 (GPIO 1 is valid ADC1_CH0)
+  Serial.println("=== ESC ARMING SIGNAL SENT (3 seconds ago) ===");
+  
   pinMode(2, OUTPUT);
   analogReadResolution(12);
   pinMode(analogPin, INPUT);
-
-  // Initialize PPM
+  
   ppm = new PPMReader(ppmInterruptPin, channelAmount);
-  Serial.println(F("\n=== PPM Receiver Initialized (FS-iA6B) ==="));
+  Serial.println(F("=== PPM Receiver Initialized (FS-iA6B) ==="));
 
-  // Initialize MPU9250
   Serial.println(F("=== Initializing MPU9250 (SPI) ==="));
   int status = IMU.begin();
   if (status < 0) {
@@ -565,30 +578,24 @@ void setup() {
 
   IMU.setAccelRange(MPU9250::ACCEL_RANGE_4G);
   IMU.setGyroRange(MPU9250::GYRO_RANGE_1000DPS);
-  
-  // === FIX IS HERE ===
-  // 19 = 50Hz (Too Slow). 0 = 1000Hz (Fastest). 
-  // We want fresh data every 4ms (250Hz), so 0 ensures data is always ready.
   IMU.setSrd(0); 
-  
-  // Enable Low Pass Filter (DLPF) to smooth out vibration before Kalman
   IMU.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_41HZ); 
 
   Serial.println(F("IMU Ready!"));
-  delay(250);
+  delay(250); 
   
-  // Initial Calibration
   gyroscope_calibration();
   
-  pwmsetup();
   LoopTimer = micros();
 
-  // Create Tasks
+  Serial.println("=== ESCs should be armed now (check for beeps) ===");
+
   xTaskCreatePinnedToCore(batteryMonitorTask, "Battery", 4096, NULL, 1, NULL, 0);
-  xTaskCreatePinnedToCore(flightControlTask, "Flight", 9216, NULL, 2, NULL, 1); // Priority 2 for Flight Task
+  xTaskCreatePinnedToCore(flightControlTask, "Flight", 9216, NULL, 2, NULL, 1);
 
   Serial.println(F("Flight controller ready!"));
 }
+
 void loop() {
   // Empty - FreeRTOS tasks handle everything
 }
