@@ -23,7 +23,7 @@ Note: Make sure FS-iA6B is set to PPM output mode!
 #include <PPMReader.h>
 
 // PPM Configuration
-byte ppmInterruptPin = 16;      // GPIO 4 - can be any interrupt-capable pin
+byte ppmInterruptPin = 5;      // GPIO 4 - can be any interrupt-capable pin
 byte channelAmount = 6;        // FS-iA6B has 6 channels in PPM mode
 PPMReader* ppm = nullptr;
 

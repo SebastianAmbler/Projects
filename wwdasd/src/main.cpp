@@ -4,17 +4,18 @@
 ====================================================================================
 Integration of tuned MPU9250 sensor with flight controller using PPM receiver
 Fixed: Motor Mixing, PPM Signal Logic, Level Calibration, GPIO Pins, ESC Arming
+**NEW: CH5 Arming Switch - Throttle must be low to arm/disarm**
 ====================================================================================
 Motor Layout:
         FRONT
           ↑
-    M1(CW)    M2(CCW)
+    M1(CCW)   M2(CW)
         \   /
          \ /
           X
          / \
         /   \
-    M3(CCW)   M4(CW)
+    M3(CW)    M4(CCW)
 ====================================================================================
 */
 
@@ -54,12 +55,34 @@ struct KalmanState {
 KalmanState pitchKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 KalmanState rollKalman = {0, 0, 0, {{0, 0}, {0, 0}}};
 
+// Add these global variables at the top with other flight control variables
+float FilteredAccX = 0, FilteredAccY = 0, FilteredAccZ = 0;
+float FilteredRateRoll = 0, FilteredRatePitch = 0, FilteredRateYaw = 0;
+
+// Low-pass filter coefficient (0.0 to 1.0)
+// Lower = more filtering (slower response)
+// Higher = less filtering (faster response)
+const float ACCEL_FILTER_ALPHA = 0.7;  // 70% new data, 30% old (moderate filtering)
+const float GYRO_FILTER_ALPHA = 0.8;   // 80% new data, 20% old (light filtering)
+
 // ===================== MUTEXES =====================
 SemaphoreHandle_t sensorMutex;
 
-// ===================== PID TUNING =====================
-float PRate = 0.08, IRate = 0.04, DRate = 0.001;
-float PAngle = 4, IAngle = 0.04, DAngle = 0.0;
+float PRate = 0.3;    // Reduced from 0.6 (was too aggressive)
+float IRate = 0.0;    // Set to 0 for initial testing
+float DRate = 0.01;   // Reduced from 0.03
+
+float PAngle = 1.2;   // Reduced from 3.0 (CRITICAL - was way too high)
+float IAngle = 0.0;   // Keep at 0
+float DAngle = 0.0;   // Keep at 0
+
+
+// ===================== ARMING SYSTEM =====================
+bool isArmed = false;
+bool prevArmSwitch = false;
+const int ARM_THRESHOLD_LOW = 1200;   // CH5 below this = disarmed
+const int ARM_THRESHOLD_HIGH = 1700;  // CH5 above this = armed
+const int THROTTLE_ARM_MAX = 1150;    // Throttle must be below this to arm/disarm
 
 // ===================== BATTERY MONITORING =====================
 const int analogPin = 2; 
@@ -69,23 +92,21 @@ float r2Value = 27000.0;
 float battery_voltage = 10;
 
 // ===================== PWM MOTOR CONTROL =====================
-// CRITICAL FIX: GPIO 1 is UART TX - causes ESC arming issues!
-// Changed Motor 2 from GPIO 1 to GPIO 4 (safe pin)
-const int PWM_PIN_M1 = 15;   // Front Left - CW
-const int PWM_PIN_M2 = 1;    // Front Right - CCW (CHANGED from GPIO 1)
-const int PWM_PIN_M3 = 7;    // Rear Left - CCW
-const int PWM_PIN_M4 = 6;    // Rear Right - CW
+const int PWM_PIN_M1 = 15;   // Front Left - CCW
+const int PWM_PIN_M2 = 1;    // Front Right - CW
+const int PWM_PIN_M3 = 7;    // Rear Left - CW
+const int PWM_PIN_M4 = 6;    // Rear Right - CCW
 const int PWM_FREQUENCY = 250;  
 const int PWM_RESOLUTION = 12;
 
 // ===================== PPM RECEIVER (FS-iA6B) =====================
-byte ppmInterruptPin = 5;
-byte channelAmount = 8;
+byte ppmInterruptPin = 17;
+byte channelAmount = 6; 
 PPMReader* ppm = nullptr;
 int ppmData[10] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000, 1000, 1000};
 
 // PPM timeout
-const unsigned long ppmTimeout = 2000000;
+const unsigned long ppmTimeout = 500000;
 unsigned long lastPPMUpdateTime = 0;
 bool ppmSignalLost = true;
 int lastPPMData[10] = {0};
@@ -193,6 +214,47 @@ void reset_motors() {
 
 unsigned long debugCounter = 0;
 
+void checkArmingSwitch() {
+  int ch5Value = ppmData[4];  // Channel 5 (index 4)
+  int throttle = ppmData[2];   // Throttle channel
+  bool currentArmSwitch = (ch5Value > ARM_THRESHOLD_HIGH);
+  
+  // Only allow arming/disarming when throttle is low
+  if (throttle < THROTTLE_ARM_MAX) {
+    // Detect rising edge (switch flipped to armed position)
+    if (currentArmSwitch && !prevArmSwitch && !isArmed) {
+      isArmed = true;
+      Serial.println("✅ ARMED - Motors active!");
+      neopixelWrite(RGB_LED_PIN, 0, 0, 80);  // Blue = Armed
+      delay(100);
+      neopixelWrite(RGB_LED_PIN, 0, 0, 0);
+    }
+    // Detect falling edge (switch flipped to disarmed position)
+    else if (!currentArmSwitch && prevArmSwitch && isArmed) {
+      isArmed = false;
+      reset_motors();
+      reset_pid();
+      Serial.println("🔴 DISARMED - Motors stopped");
+      neopixelWrite(RGB_LED_PIN, 80, 0, 0);  // Red = Disarmed
+      delay(100);
+      neopixelWrite(RGB_LED_PIN, 0, 0, 0);
+    }
+  } else {
+    // If someone tries to arm with throttle up, prevent it
+    if (currentArmSwitch && !prevArmSwitch && !isArmed) {
+      Serial.println("⚠️  Cannot arm: Lower throttle first!");
+      for (int i = 0; i < 3; i ++) {
+        neopixelWrite(RGB_LED_PIN, 80, 40, 0);  // Orange warning
+        delay(100);
+        neopixelWrite(RGB_LED_PIN, 0, 0, 0);
+        delay(100);
+      }
+    }
+  }
+  
+  prevArmSwitch = currentArmSwitch;
+}
+
 void ppmloop() {
   unsigned long currentTime = micros();
   int validChannelCount = 0;
@@ -225,6 +287,12 @@ void ppmloop() {
     ppmData[3] = 1500;
     ppmData[4] = 1000;
     ppmData[5] = 1000;
+    
+    // Auto-disarm on signal loss
+    if (isArmed) {
+      isArmed = false;
+      Serial.println("🔴 SIGNAL LOST - Auto-disarmed!");
+    }
     
     reset_pid();
     reset_motors();
@@ -323,14 +391,32 @@ void gyro_signals(void) {
       remapAxes(calAccel, tempAccel, true);
       remapAxes(calGyro, tempGyro, true);
 
-      RateRoll = tempGyro[0] * RAD_TO_DEG;
-      RatePitch = tempGyro[1] * RAD_TO_DEG;
-      RateYaw = tempGyro[2] * RAD_TO_DEG;
+      // Raw values before filtering
+      float rawRateRoll  = -tempGyro[0] * RAD_TO_DEG;
+      float rawRatePitch = -tempGyro[1] * RAD_TO_DEG;
+      float rawRateYaw   =  tempGyro[2] * RAD_TO_DEG;
+      float rawAccX = tempAccel[0];
+      float rawAccY = tempAccel[1];
+      float rawAccZ = tempAccel[2];
 
-      AccX = tempAccel[0];
-      AccY = tempAccel[1];
-      AccZ = tempAccel[2];
+      // Apply low-pass filter (Exponential Moving Average)
+      FilteredRateRoll  = (GYRO_FILTER_ALPHA * rawRateRoll)  + ((1.0 - GYRO_FILTER_ALPHA) * FilteredRateRoll);
+      FilteredRatePitch = (GYRO_FILTER_ALPHA * rawRatePitch) + ((1.0 - GYRO_FILTER_ALPHA) * FilteredRatePitch);
+      FilteredRateYaw   = (GYRO_FILTER_ALPHA * rawRateYaw)   + ((1.0 - GYRO_FILTER_ALPHA) * FilteredRateYaw);
+      
+      FilteredAccX = (ACCEL_FILTER_ALPHA * rawAccX) + ((1.0 - ACCEL_FILTER_ALPHA) * FilteredAccX);
+      FilteredAccY = (ACCEL_FILTER_ALPHA * rawAccY) + ((1.0 - ACCEL_FILTER_ALPHA) * FilteredAccY);
+      FilteredAccZ = (ACCEL_FILTER_ALPHA * rawAccZ) + ((1.0 - ACCEL_FILTER_ALPHA) * FilteredAccZ);
 
+      // Use filtered values
+      RateRoll  = FilteredRateRoll;
+      RatePitch = FilteredRatePitch;
+      RateYaw   = FilteredRateYaw;
+      AccX = FilteredAccX;
+      AccY = FilteredAccY;
+      AccZ = FilteredAccZ;
+
+      // Calculate angles from filtered accelerometer
       AngleRoll = atan2(AccY, sqrt(AccX * AccX + AccZ * AccZ)) * RAD_TO_DEG;
       AnglePitch = atan2(-AccX, sqrt(AccY * AccY + AccZ * AccZ)) * RAD_TO_DEG;
 
@@ -388,9 +474,13 @@ void batteryMonitorTask(void *pvParameters) {
       vTaskDelay(pdMS_TO_TICKS(1000));
       neopixelWrite(RGB_LED_PIN, 0, 0, 0); 
       vTaskDelay(pdMS_TO_TICKS(1000));
-
     } else {
-      neopixelWrite(RGB_LED_PIN, 0, 80, 0);
+      // Show armed/disarmed status on battery check
+      if (isArmed) {
+        neopixelWrite(RGB_LED_PIN, 0, 0, 80);  // Blue when armed
+      } else {
+        neopixelWrite(RGB_LED_PIN, 0, 80, 0);  // Green when disarmed
+      }
       vTaskDelay(pdMS_TO_TICKS(1000));
       neopixelWrite(RGB_LED_PIN, 0, 0, 0); 
       vTaskDelay(pdMS_TO_TICKS(1000));
@@ -401,28 +491,13 @@ void batteryMonitorTask(void *pvParameters) {
 void flightControlTask(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(4);
-  
-  bool previousCh5State = false;
 
   while (1) {
     gyro_signals();
     ppmloop(); 
+    checkArmingSwitch();  // Check CH5 arming switch
 
-    bool currentCh5State = ppmData[4] > 1800;
-    bool isThrottleLow = ppmData[2] < 1050;
-
-    if (currentCh5State && !previousCh5State && isThrottleLow) {
-      reset_motors();
-      pwmloop(1000, PWM_PIN_M1); pwmloop(1000, PWM_PIN_M2);
-      pwmloop(1000, PWM_PIN_M3); pwmloop(1000, PWM_PIN_M4);
-      
-      gyroscope_calibration();
-      
-      reset_pid();
-      xLastWakeTime = xTaskGetTickCount();
-    }
-    previousCh5State = currentCh5State;
-
+    // Apply gyro calibration
     RateRoll -= RateCalibrationRoll;
     RatePitch -= RateCalibrationPitch;
     RateYaw -= RateCalibrationYaw;
@@ -434,13 +509,40 @@ void flightControlTask(void *pvParameters) {
     KalmanAnglePitch = kalmanFilter(pitchKalman, RatePitch, AnglePitch, 0.004);
 
     debugCounter++;
-    if (debugCounter % 50 == 0) {
-      Serial.print("Roll: ");
-      Serial.print(KalmanAngleRoll, 1);
-      Serial.print("° | Pitch: ");
-      Serial.print(KalmanAnglePitch, 1);
-      Serial.println("°");
-    }
+ // Add this to flightControlTask() - Replace your existing debug output
+
+debugCounter++;
+if (debugCounter % 25 == 0) {
+    // Calculate vibration metric
+    float vibration = abs(AccX) + abs(AccY);
+    
+    // Calculate acceleration variance (detects oscillations)
+    static float prevAccX = 0, prevAccY = 0, prevAccZ = 0;
+    float accelChange = abs(AccX - prevAccX) + abs(AccY - prevAccY) + abs(AccZ - prevAccZ);
+    prevAccX = AccX;
+    prevAccY = AccY;
+    prevAccZ = AccZ;
+    
+    Serial.print("Thr: "); Serial.print(InputThrottle);
+    Serial.print(" | AccZ: "); Serial.print(AccZ, 2);
+    Serial.print(" | Vib: "); Serial.print(vibration, 2);
+    Serial.print(" | Jitter: "); Serial.print(accelChange, 2);
+    Serial.print(" | Roll: "); Serial.print(KalmanAngleRoll, 1);
+    Serial.print("° | Pitch: "); Serial.print(KalmanAnglePitch, 1);
+    Serial.print("° | Armed: "); Serial.println(isArmed ? "YES" : "NO");
+}
+
+// CRITICAL: Add motor output monitoring
+if (debugCounter % 100 == 0 && isArmed) {
+    Serial.print("MOTORS -> M1:");
+    Serial.print(MotorInput1);
+    Serial.print(" M2:");
+    Serial.print(MotorInput2);
+    Serial.print(" M3:");
+    Serial.print(MotorInput3);
+    Serial.print(" M4:");
+    Serial.println(MotorInput4);
+}
 
     DesiredAngleRoll = 0.10 * (ppmData[0] - 1500);    
     DesiredAnglePitch = 0.10 * (ppmData[1] - 1500);  
@@ -482,34 +584,33 @@ void flightControlTask(void *pvParameters) {
 
     if (InputThrottle > 1800) InputThrottle = 1800;
 
-    // === CORRECTED MOTOR MIXING FOR YOUR LAYOUT ===
-    // M1: Front Left (CW)    - Roll+ Pitch- Yaw+
-    // M2: Front Right (CCW)  - Roll- Pitch- Yaw-
-    // M3: Rear Left (CCW)    - Roll+ Pitch+ Yaw-
-    // M4: Rear Right (CW)    - Roll- Pitch+ Yaw+
-    
-    MotorInput1 = 1.024 * (InputThrottle + InputRoll - InputPitch + InputYaw);
-    MotorInput2 = 1.024 * (InputThrottle - InputRoll - InputPitch - InputYaw);
-    MotorInput3 = 1.024 * (InputThrottle + InputRoll + InputPitch - InputYaw);
-    MotorInput4 = 1.024 * (InputThrottle - InputRoll + InputPitch + InputYaw);
+    // Motor mixing - ONLY if armed
+    // M1 (Front Left - CCW): Throttle + Roll - Pitch + Yaw
+    // M2 (Front Right - CW): Throttle - Roll - Pitch - Yaw
+    // M3 (Rear Left - CW):   Throttle + Roll + Pitch - Yaw
+    // M4 (Rear Right - CCW): Throttle - Roll + Pitch + Yaw
+    if (isArmed && ppmData[2] >= 1150) {
+      MotorInput1 = (InputThrottle + InputRoll - InputPitch + InputYaw); 
+      MotorInput2 = (InputThrottle - InputRoll - InputPitch - InputYaw); 
+      MotorInput3 = (InputThrottle + InputRoll + InputPitch - InputYaw); 
+      MotorInput4 = (InputThrottle - InputRoll + InputPitch + InputYaw);
 
-    if (MotorInput1 > 2000) MotorInput1 = 1989;
-    if (MotorInput2 > 2000) MotorInput2 = 1989;
-    if (MotorInput3 > 2000) MotorInput3 = 1989;
-    if (MotorInput4 > 2000) MotorInput4 = 1989;
+      if (MotorInput1 > 2000) MotorInput1 = 1989;
+      if (MotorInput2 > 2000) MotorInput2 = 1989;
+      if (MotorInput3 > 2000) MotorInput3 = 1989;
+      if (MotorInput4 > 2000) MotorInput4 = 1989;
 
-    int ThrottleIdle = 1180;
-    if (MotorInput1 < ThrottleIdle) MotorInput1 = ThrottleIdle;
-    if (MotorInput2 < ThrottleIdle) MotorInput2 = ThrottleIdle;
-    if (MotorInput3 < ThrottleIdle) MotorInput3 = ThrottleIdle;
-    if (MotorInput4 < ThrottleIdle) MotorInput4 = ThrottleIdle;
-
-    int ThrottleCutOff = 1000;
-    if (ppmData[2] < 1050) {
-      MotorInput1 = ThrottleCutOff;
-      MotorInput2 = ThrottleCutOff;
-      MotorInput3 = ThrottleCutOff;
-      MotorInput4 = ThrottleCutOff;
+      int ThrottleIdle = 1350;
+      if (MotorInput1 < ThrottleIdle) MotorInput1 = ThrottleIdle;
+      if (MotorInput2 < ThrottleIdle) MotorInput2 = ThrottleIdle;
+      if (MotorInput3 < ThrottleIdle) MotorInput3 = ThrottleIdle;
+      if (MotorInput4 < ThrottleIdle) MotorInput4 = ThrottleIdle;
+    } else {
+      // Disarmed or throttle too low - motors off
+      MotorInput1 = 1000;
+      MotorInput2 = 1000;
+      MotorInput3 = 1000;
+      MotorInput4 = 1000;
       reset_pid();
     }
 
@@ -526,7 +627,6 @@ void flightControlTask(void *pvParameters) {
 
 void setup() {
   // === STEP 1: SETUP PWM IMMEDIATELY (BEFORE SERIAL!) ===
-  // This prevents UART noise on GPIO 1 from interfering with ESCs
   pinMode(PWM_PIN_M1, OUTPUT);
   pinMode(PWM_PIN_M2, OUTPUT);
   pinMode(PWM_PIN_M3, OUTPUT);
@@ -542,13 +642,13 @@ void setup() {
   ledcAttachPin(PWM_PIN_M3, 2); 
   ledcAttachPin(PWM_PIN_M4, 3);
   
-  // Send 1000μs immediately (1024 = 25% of 4095 at 250Hz)
+  // Send 1000μs immediately for ESC arming
   ledcWrite(0, 1024);
   ledcWrite(1, 1024);
   ledcWrite(2, 1024);
   ledcWrite(3, 1024);
   
-  delay(3000); // CRITICAL: Wait for ESCs to detect arming signal
+  delay(3000); // Wait for ESC initialization
   
   // === STEP 2: NOW initialize Serial and other components ===
   sensorMutex = xSemaphoreCreateMutex();
@@ -559,14 +659,14 @@ void setup() {
     while (1);
   }
 
-  Serial.println("=== ESC ARMING SIGNAL SENT (3 seconds ago) ===");
+  Serial.println("=== ESC ARMING SIGNAL SENT ===");
   
   pinMode(2, OUTPUT);
   analogReadResolution(12);
   pinMode(analogPin, INPUT);
   
   ppm = new PPMReader(ppmInterruptPin, channelAmount);
-  Serial.println(F("=== PPM Receiver Initialized (FS-iA6B) ==="));
+  Serial.println(F("=== PPM Receiver Initialized ==="));
 
   Serial.println(F("=== Initializing MPU9250 (SPI) ==="));
   int status = IMU.begin();
@@ -588,12 +688,12 @@ void setup() {
   
   LoopTimer = micros();
 
-  Serial.println("=== ESCs should be armed now (check for beeps) ===");
+  Serial.println("=== Flight controller ready! ===");
+  Serial.println("🔴 DISARMED - Flip CH5 switch to arm");
+  Serial.println("⚠️  Throttle must be LOW to arm/disarm");
 
   xTaskCreatePinnedToCore(batteryMonitorTask, "Battery", 4096, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(flightControlTask, "Flight", 9216, NULL, 2, NULL, 1);
-
-  Serial.println(F("Flight controller ready!"));
 }
 
 void loop() {

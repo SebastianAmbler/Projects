@@ -24,7 +24,7 @@
 #include <ESP32Servo.h>
 
 // Motor pins
-const int MOTOR_PINS[] = {7, 6, 15, 16};
+const int MOTOR_PINS[] = {7, 6, 15, 1};
 const int NUM_MOTORS = 4;
 
 // SimonK ESC PWM ranges (microseconds)
